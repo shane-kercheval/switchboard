@@ -216,8 +216,8 @@ struct BoundedOutput {
     success: Option<bool>,
 }
 
-/// Run a command to completion with a hard time bound. Returns `None` only when
-/// the command could not be started or did not finish in time; a command that
+/// Run a command to completion with a hard time bound. Fails only when the
+/// command could not be started or did not finish in time; a command that
 /// finished unsuccessfully still returns its output.
 ///
 /// **Why this exists rather than `Command::output()`.** `output()` waits without
@@ -238,7 +238,6 @@ struct BoundedOutput {
 /// `None` because these have entirely different causes and remedies, and a
 /// failure whose reason is discarded can only be diagnosed by guessing — which
 /// is how the PATH capture's real-world failure survived two rounds of theories.
-#[cfg(unix)]
 #[derive(Debug)]
 pub enum BoundedFailure {
     /// The command could not be started at all.
@@ -249,7 +248,6 @@ pub enum BoundedFailure {
     Cancelled,
 }
 
-#[cfg(unix)]
 impl std::fmt::Display for BoundedFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -261,13 +259,15 @@ impl std::fmt::Display for BoundedFailure {
 }
 
 #[cfg(unix)]
-fn run_bounded(command: std::process::Command, timeout: Duration) -> Option<BoundedOutput> {
+fn run_bounded(
+    command: std::process::Command,
+    timeout: Duration,
+) -> Result<BoundedOutput, BoundedFailure> {
     run_bounded_cancellable(
         command,
         timeout,
         &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
-    .ok()
 }
 
 /// As [`run_bounded`], but abandons the command early when `cancel` is set,
@@ -463,9 +463,14 @@ struct BoundedOutput {
 }
 
 #[cfg(not(unix))]
-fn run_bounded(mut command: std::process::Command, _timeout: Duration) -> Option<BoundedOutput> {
-    let output = command.output().ok()?;
-    Some(BoundedOutput {
+fn run_bounded(
+    mut command: std::process::Command,
+    _timeout: Duration,
+) -> Result<BoundedOutput, BoundedFailure> {
+    let output = command
+        .output()
+        .map_err(|err| BoundedFailure::Spawn(err.to_string()))?;
+    Ok(BoundedOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         success: Some(output.status.success()),
     })
@@ -1283,11 +1288,29 @@ pub fn parse_cli_version(line: &str) -> Option<String> {
 
 /// Best-effort version string for a harness CLI: the first line of
 /// `<binary> --version`, trimmed. Returns `None` when the binary can't be
-/// resolved/invoked or reports nothing — the value is display-only, never
-/// load-bearing, so any failure collapses to "unknown" rather than an error.
+/// resolved/invoked or reports nothing. Any failure collapses to "unknown"
+/// rather than an error; the Codex `--trust` gate treats unknown as current.
 pub fn fetch_version(binary: &Path) -> Option<String> {
-    let resolved = resolve_binary(binary).ok()?;
+    fetch_version_in(binary, None).ok().flatten()
+}
+
+/// `<binary> --version` could not be started: the binary can't be resolved, or
+/// the spawn failed, as it does when the working folder doesn't exist.
+#[derive(Debug)]
+pub struct VersionNotStarted;
+
+/// [`fetch_version`] run in `cwd`, or in this process's folder when `None`. A
+/// version manager's shim answers for the version pinned in its working folder.
+/// `Ok(None)` is a `--version` that ran and reported no version.
+pub fn fetch_version_in(
+    binary: &Path,
+    cwd: Option<&Path>,
+) -> Result<Option<String>, VersionNotStarted> {
+    let resolved = resolve_binary(binary).map_err(|_| VersionNotStarted)?;
     let mut command = std::process::Command::new(&resolved);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     // Same PATH augmentation as a dispatched turn: a `--version` that shells
     // out (or is an env-shebang script) must resolve its interpreter/tools the
     // way a real turn would, so the displayed version matches what runs.
@@ -1302,12 +1325,16 @@ pub fn fetch_version(binary: &Path) -> Option<String> {
     // An *unknown* verdict is accepted rather than rejected — the command ran and
     // produced output, and `parse_cli_version` rejects anything that isn't a
     // version string, so the parse is the real gate in that case.
-    let output = run_bounded(command, VERSION_PROBE_TIMEOUT)?;
+    let output = match run_bounded(command, VERSION_PROBE_TIMEOUT) {
+        Ok(output) => output,
+        Err(BoundedFailure::Spawn(_)) => return Err(VersionNotStarted),
+        Err(BoundedFailure::TimedOut | BoundedFailure::Cancelled) => return Ok(None),
+    };
     if output.success == Some(false) {
-        return None;
+        return Ok(None);
     }
     let line = output.stdout.lines().next().unwrap_or("").trim().to_owned();
-    (!line.is_empty()).then_some(line)
+    Ok((!line.is_empty()).then_some(line))
 }
 
 /// Time bound for a `<binary> --version` probe. Far tighter than the PATH
@@ -2291,7 +2318,7 @@ mod tests {
         let result = run_bounded(command, Duration::from_millis(300));
 
         assert!(
-            result.is_none(),
+            result.is_err(),
             "an overrunning command must not return output"
         );
         assert!(
@@ -2366,7 +2393,7 @@ mod tests {
         let started = std::time::Instant::now();
         let output = run_bounded(command, Duration::from_millis(200));
         // The direct child exited cleanly, so this is the success path.
-        assert!(output.is_some());
+        assert!(output.is_ok());
 
         // The reader's own deadline is the command timeout plus the drain grace;
         // it must expire rather than run forever.

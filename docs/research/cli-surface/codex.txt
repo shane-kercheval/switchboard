@@ -1,4 +1,4 @@
-version: codex-cli 0.165.0
+version: codex-cli 0.170.0
 
 ===== codex --help
 Codex CLI
@@ -9,7 +9,7 @@ Usage: codex [OPTIONS] [PROMPT]
        codex [OPTIONS] <COMMAND> [ARGS]
 
 Commands:
-  agents            Browse all agent sessions on the shared local app-server daemon
+  agents            Open the agent command center to browse and switch sessions
   exec              Run Codex non-interactively [aliases: e]
   review            Run a code review non-interactively
   login             Manage login
@@ -141,7 +141,7 @@ Options:
           Print version
 
 ===== codex agents --help
-Browse all agent sessions on the shared local app-server daemon
+Open the agent command center to browse and switch sessions
 
 Usage: codex agents [OPTIONS]
 
@@ -153,6 +153,9 @@ Options:
           
           Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
           shell_environment_policy.inherit=all`
+
+      --no-daemon
+          Run the agents overview with an embedded app server
 
       --enable <FEATURE>
           Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
@@ -268,6 +271,10 @@ Options:
       --skip-git-repo-check
           Allow running Codex outside a Git repository
 
+      --trust
+          Save trust for this project and future chats, including MCP commands outside the sandbox.
+          Persists even with --ephemeral. Does not override an explicitly untrusted project
+
       --ephemeral
           Run without persisting session files to disk
 
@@ -365,6 +372,10 @@ Options:
       --skip-git-repo-check
           Allow running Codex outside a Git repository
 
+      --trust
+          Save trust for this project and future chats, including MCP commands outside the sandbox.
+          Persists even with --ephemeral. Does not override an explicitly untrusted project
+
       --ephemeral
           Run without persisting session files to disk
 
@@ -445,6 +456,10 @@ Options:
 
       --skip-git-repo-check
           Allow running Codex outside a Git repository
+
+      --trust
+          Save trust for this project and future chats, including MCP commands outside the sandbox.
+          Persists even with --ephemeral. Does not override an explicitly untrusted project
 
       --ephemeral
           Run without persisting session files to disk
@@ -533,6 +548,10 @@ Options:
       --skip-git-repo-check
           Allow running Codex outside a Git repository
 
+      --trust
+          Save trust for this project and future chats, including MCP commands outside the sandbox.
+          Persists even with --ephemeral. Does not override an explicitly untrusted project
+
       --ephemeral
           Run without persisting session files to disk
 
@@ -579,14 +598,18 @@ Options:
       --enable <FEATURE>
           Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
 
+      --trust
+          Save trust for this project and future chats, including MCP commands outside the sandbox.
+          Persists even with --ephemeral. Does not override an explicitly untrusted project
+
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
+
       --uncommitted
           Review staged, unstaged, and untracked changes
 
       --base <BRANCH>
           Review changes against the given base branch
-
-      --disable <FEATURE>
-          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
 
       --commit <SHA>
           Review the changes introduced by a commit
@@ -1846,6 +1869,9 @@ Options:
       --disable <FEATURE>
           Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
 
+      --network-only
+          Run config, network environment, provider HTTP, and Responses WebSocket checks
+
       --summary
           Only show grouped check rows and the final count summary
 
@@ -2247,6 +2273,10 @@ Options:
       --disable <FEATURE>
           Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
 
+      --resume
+          After queueing, try to resume the thread on the local daemon or selected --remote server.
+          A failed resume produces a warning and the command still succeeds
+
       --remote <ADDR>
           Connect the TUI to a remote app server endpoint.
           
@@ -2256,61 +2286,23 @@ Options:
           Name of the environment variable containing the bearer token to send to a remote app
           server websocket
 
-  -i, --image <FILE>...
-          Optional image(s) to attach to the initial prompt
-
-  -m, --model <MODEL>
-          Model the agent should use
-
-      --oss
-          Use open-source provider
-
-      --local-provider <OSS_PROVIDER>
-          Specify which local provider to use (lmstudio or ollama). If not specified with --oss,
-          will use config default or show selection
-
   -p, --profile <CONFIG_PROFILE_V2>
           Layer $CODEX_HOME/<name>.config.toml on top of the base user config
-
-  -s, --sandbox <SANDBOX_MODE>
-          Select the sandbox policy to use when executing model-generated shell commands
-          
-          [possible values: read-only, workspace-write, danger-full-access]
-
-      --approve-for-me
-          Route approval requests through automatic review using the workspace-write sandbox
-
-      --dangerously-bypass-approvals-and-sandbox
-          Skip all confirmation prompts and execute commands without sandboxing. EXTREMELY
-          DANGEROUS. Intended solely for running in environments that are externally sandboxed
-
-      --dangerously-bypass-hook-trust
-          Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS.
-          Intended only for automation that already vets hook sources
-
-  -C, --cd <DIR>
-          Tell the agent to use the specified directory as its working root
-
-      --worktree
-          Run the session in a new managed Git worktree
-
-      --add-dir <DIR>
-          Additional directories that should be writable alongside the primary workspace
 
       --strict-config
           Error out when config.toml contains fields that are not recognized by this version of
           Codex
 
   -c, --config <key=value>
-          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.
-          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed
-          as TOML. If it fails to parse as TOML, the raw string is used as a literal.
-          
-          Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
-          shell_environment_policy.inherit=all`
+          Override a startup configuration value (key=value). Queued messages use the thread's
+          model.
 
   -h, --help
           Print help (see a summary with '-h')
+
+Local server options (without --remote):
+  -C, --cd <DIR>
+          Tell the agent to use the specified directory as its working root
 
 ===== codex archive --help
 Archive a saved session by id or session name
@@ -3029,8 +3021,17 @@ Options:
       --use-agent-identity-auth
           Use Agent Identity auth from CODEX_ACCESS_TOKEN for remote registration
 
+      --registration-bearer-stdin
+          Read one registration bearer from stdin
+
       --executor-credential-stdin
           Read rotating executor credentials from stdin; exit when the pipe closes
+
+      --chatgpt-token-stdin
+          Read a ChatGPT access token from stdin for HTTPS registration
+
+      --chatgpt-account-id <ID>
+          ChatGPT account ID. Must match the token's account claim when present
 
       --aws-sigv4
           Sign Direct registration and WebSocket handshake requests with AWS SigV4
@@ -3111,6 +3112,9 @@ Options:
 
       --use-agent-identity-auth
           Use Agent Identity auth from CODEX_ACCESS_TOKEN for remote registration
+
+      --registration-bearer-stdin
+          Read one registration bearer from stdin
 
       --executor-credential-stdin
           Read rotating executor credentials from stdin; exit when the pipe closes
@@ -3253,6 +3257,7 @@ account/logout
 account/rateLimitResetCredit/consume
 account/rateLimits/read
 account/read
+account/securitySetup/read
 account/sendAddCreditsNudgeEmail
 account/usage/read
 account/workspaceMessages/read
@@ -3297,6 +3302,8 @@ mcpServer/tool/call
 mcpServerStatus/list
 model/list
 modelProvider/capabilities/read
+modelProvider/config/write
+modelProvider/list
 permissionProfile/list
 plugin/install
 plugin/installed
@@ -3355,6 +3362,9 @@ windowsSandbox/setupStart
 account/bedrock/checkGovCloudRequirements
 account/bedrock/discover
 account/bedrock/setup
+account/gcp/setup
+accountSession/list
+accountSession/switch
 collaborationMode/list
 environment/add
 environment/info
@@ -3392,11 +3402,13 @@ thread/backgroundTerminals/clean
 thread/backgroundTerminals/list
 thread/backgroundTerminals/terminate
 thread/decrement_elicitation
+thread/guardianReview
 thread/increment_elicitation
 thread/items/read
 thread/memory/read
 thread/memoryMode/set
 thread/prediction/request
+thread/prepareApprovedPlan
 thread/queue/add
 thread/queue/delete
 thread/queue/list

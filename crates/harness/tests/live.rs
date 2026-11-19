@@ -13,10 +13,10 @@ use serde_json::json;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, CODEX_FORK_TIMEOUT, ClaudeCodeAdapter, CodexAdapter,
-    ContentKind, ContextWindowSource, DispatchOptions, EditChange, FailureKind, HarnessAdapter,
-    RateLimitSource, ToolFacet, Turn, TurnItem, TurnOutcome, TurnUsage, UserPromptSource,
-    claude_session_file_path, find_codex_session_file_for_attach, fork_codex_session,
-    load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
+    CodexRunFlags, ContentKind, ContextWindowSource, DispatchOptions, EditChange, FailureKind,
+    HarnessAdapter, RateLimitSource, ToolFacet, Turn, TurnItem, TurnOutcome, TurnUsage,
+    UserPromptSource, claude_session_file_path, find_codex_session_file_for_attach,
+    fork_codex_session, load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
 };
 use uuid::Uuid;
 
@@ -2159,6 +2159,11 @@ async fn live_claude_slash_leading_prompt_reaches_model() {
 }
 
 // --- Codex live tests ---
+//
+// The adapter passes `--trust`, so a Codex live test that runs in a git repo or
+// a folder with `.codex/`, using the developer's real `CODEX_HOME`, writes a
+// permanent trust entry into their `config.toml`. Use an isolated `CODEX_HOME`
+// where the test allows. A plain temporary folder gets no entry.
 
 fn live_codex_agent() -> AgentRecord {
     AgentRecord {
@@ -2630,7 +2635,7 @@ async fn live_codex_astra_dispatches_and_hydrates() {
     let agent_id = Uuid::now_v7();
     let mut agent = live_codex_agent();
     agent.id = agent_id;
-    agent.model = Some("gpt-6-astra".to_owned());
+    agent.model = Some("gpt-6.2-astra".to_owned());
     agent.effort = Some("low".to_owned());
 
     let events: Vec<AdapterEvent> = adapter
@@ -2647,7 +2652,7 @@ async fn live_codex_astra_dispatches_and_hydrates() {
         .await;
 
     let (model, effort) = turn_end_model_effort(&events).expect("Astra TurnEnd");
-    assert_eq!(model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(model.as_deref(), Some("gpt-6.2-astra"));
     assert_eq!(effort.as_deref(), Some("low"));
     assert!(
         events.iter().any(|event| matches!(
@@ -2673,7 +2678,7 @@ async fn live_codex_astra_dispatches_and_hydrates() {
         .collect();
     assert_eq!(
         hydrated_model_effort,
-        vec![(Some("gpt-6-astra".to_owned()), Some("low".to_owned()))]
+        vec![(Some("gpt-6.2-astra".to_owned()), Some("low".to_owned()))]
     );
 }
 
@@ -2832,7 +2837,10 @@ async fn live_codex_compressed_rollout_loads_forks_and_resumes() {
         tmp.path(),
         &thread_id,
         &agent.selection(),
-        &[],
+        &CodexRunFlags {
+            own_server_overrides: Vec::new(),
+            trust: true,
+        },
         CODEX_FORK_TIMEOUT,
     )
     .await
@@ -2914,7 +2922,10 @@ async fn live_codex_fork_without_a_prompt_creates_an_idle_session_that_inherits_
         tmp.path(),
         &parent_thread_id,
         &agent.selection(),
-        &[],
+        &CodexRunFlags {
+            own_server_overrides: Vec::new(),
+            trust: true,
+        },
         CODEX_FORK_TIMEOUT,
     )
     .await
@@ -3038,7 +3049,10 @@ async fn live_codex_fork_loads_the_parents_history_up_to_the_fork_point() {
         tmp.path(),
         &parent_thread_id,
         &parent.selection(),
-        &[],
+        &CodexRunFlags {
+            own_server_overrides: Vec::new(),
+            trust: true,
+        },
         CODEX_FORK_TIMEOUT,
     )
     .await
@@ -4725,7 +4739,11 @@ async fn live_codex_compact_succeeds_and_the_conversation_continues() {
     };
     assert_eq!(compaction["model"], "gpt-6-luna");
     assert_eq!(compaction["effort"], "medium");
-    assert_eq!(compaction["sandbox_policy"], reply["sandbox_policy"]);
+    // Checked against the expected value rather than between the two turns, so
+    // the test fails if Codex stops recording `sandbox_policy` at all.
+    for turn in [reply, compaction] {
+        assert_eq!(turn["sandbox_policy"]["type"], "danger-full-access");
+    }
     assert_eq!(compaction["approval_policy"], reply["approval_policy"]);
 
     let transcript = load_codex_transcript(
@@ -4868,7 +4886,10 @@ async fn live_codex_compact_of_a_fork_keeps_its_inherited_context() {
         tmp.path(),
         &parent_thread_id,
         &parent.selection(),
-        &[],
+        &CodexRunFlags {
+            own_server_overrides: Vec::new(),
+            trust: true,
+        },
         CODEX_FORK_TIMEOUT,
     )
     .await
@@ -5240,7 +5261,7 @@ async fn live_codex_apply_patch_emits_edit_facet() {
     std::fs::write(cwd.path().join("alpha.txt"), "foo\n").unwrap();
     let adapter = CodexAdapter::new();
     let mut agent = live_codex_agent();
-    agent.model = Some("gpt-6.1-sol".to_owned());
+    agent.model = Some("gpt-6.2-sol".to_owned());
     agent.effort = Some("medium".to_owned());
 
     let events: Vec<AdapterEvent> = adapter

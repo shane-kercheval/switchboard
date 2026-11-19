@@ -2689,6 +2689,19 @@ async fn create_codex_fork(
             name: source.name.clone(),
         });
     };
+    // Found once, so the version decides `--trust` for the program that runs.
+    let binary = switchboard_harness::subprocess::resolve_binary(codex_binary)
+        .map_err(|_| switchboard_harness::CodexForkError::BinaryNotFound)?;
+    // Read before the parent's lock is taken: the first read of a program in a
+    // folder runs `codex --version` and waits for it.
+    let codex_version = tokio::task::spawn_blocking({
+        let binary = binary.clone();
+        let directory = project.directory.clone();
+        move || switchboard_harness::codex_version(&binary, &directory)
+    })
+    .await
+    .ok()
+    .flatten();
     let key = crate::session_lock::session_lock_key(source.harness, parent, &project.directory)?;
     let lock_root = state.lock_root.clone();
     // Off the async worker: acquisition opens a file and, when contended,
@@ -2707,19 +2720,20 @@ async fn create_codex_fork(
         },
         other => other,
     })?;
-    let own_server_overrides = switchboard_harness::codex_own_server_overrides(
-        state.own_mcp_server(),
+    let flags = switchboard_harness::CodexRunFlags::for_run(
         &state.codex_config_sources,
         home_dir,
         &project.directory,
+        Some(state.own_mcp_server()),
+        codex_version.as_deref(),
     );
     let created = switchboard_harness::fork_codex_session(
-        codex_binary,
+        &binary,
         home_dir,
         &project.directory,
         parent_thread_id,
         &source.selection(),
-        &own_server_overrides,
+        &flags,
         switchboard_harness::CODEX_FORK_TIMEOUT,
     )
     .await;
@@ -9010,12 +9024,23 @@ mod tests {
 
     /// A stand-in for `codex exec fork`, written as a shell script because the
     /// harness crate's `fake_codex` binary isn't built for this crate's tests.
-    /// It runs `before` (shell), then does what a promptless fork does: writes
-    /// the new rollout under `home` and prints `thread.started` with its id.
+    /// It answers `--version` as Codex 0.170.0 does. Any other call runs
+    /// `before` (shell), then does what a promptless fork does: writes the new
+    /// rollout under `home` and prints `thread.started` with its id.
     fn codex_fork_shim(dir: &Path, home: &Path, before: &str) -> PathBuf {
+        codex_fork_shim_answering(dir, home, "echo 'codex-cli 0.170.0'", before)
+    }
+
+    /// [`codex_fork_shim`] that runs `version_answer` (shell) for `--version`.
+    fn codex_fork_shim_answering(
+        dir: &Path,
+        home: &Path,
+        version_answer: &str,
+        before: &str,
+    ) -> PathBuf {
         let folder = home.join(".codex/sessions/2026/10/11");
         let script = format!(
-            "#!/bin/sh\n{before}\nmkdir -p '{folder}'\n: > '{folder}/rollout-2026-10-11T00-00-01-{CODEX_NEW_FORK_THREAD}.jsonl'\necho '{{\"type\":\"thread.started\",\"thread_id\":\"{CODEX_NEW_FORK_THREAD}\"}}'\n",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then {version_answer}; exit; fi\n{before}\nmkdir -p '{folder}'\n: > '{folder}/rollout-2026-10-11T00-00-01-{CODEX_NEW_FORK_THREAD}.jsonl'\necho '{{\"type\":\"thread.started\",\"thread_id\":\"{CODEX_NEW_FORK_THREAD}\"}}'\n",
             folder = folder.display(),
         );
         let shim = dir.join("codex");
@@ -9143,6 +9168,98 @@ mod tests {
         }
     }
 
+    /// The arguments a Codex fork passes to `codex`, from a Codex whose
+    /// `--version` reports `version_line` (or fails when `None`), with
+    /// `config(project folder)` as the user's `~/.codex/config.toml`. The
+    /// app's Codex adapter is the mock, which reports no version.
+    async fn codex_fork_argv(
+        version_line: Option<&str>,
+        config: impl FnOnce(&Path) -> String,
+    ) -> Vec<String> {
+        let answer =
+            version_line.map_or_else(|| "exit 1".to_owned(), |line| format!("echo '{line}'"));
+        codex_fork_argv_answering(&answer, config).await
+    }
+
+    /// [`codex_fork_argv`] from a Codex that runs `version_answer` (shell) for
+    /// `--version`.
+    async fn codex_fork_argv_answering(
+        version_answer: &str,
+        config: impl FnOnce(&Path) -> String,
+    ) -> Vec<String> {
+        let (tmp, home, state, _project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        std::fs::write(home.path().join(".codex/config.toml"), config(tmp.path())).unwrap();
+        let argv_path = home.path().join("argv");
+        let shim = codex_fork_shim_answering(
+            home.path(),
+            home.path(),
+            version_answer,
+            &format!("printf '%s\\n' \"$@\" > '{}'", argv_path.display()),
+        );
+        fork_agent_with(&state, source_id, home.path(), &shim, path_settled())
+            .await
+            .expect("forking an idle Codex agent with a session should succeed");
+        std::fs::read_to_string(&argv_path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn codex_fork_passes_trust_unless_the_user_marked_the_folder_untrusted() {
+        let current = Some("codex-cli 0.170.0");
+        let argv = codex_fork_argv(current, |_| String::new()).await;
+        assert!(argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
+
+        let argv = codex_fork_argv(current, |folder| {
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+                folder.display()
+            )
+        })
+        .await;
+        assert!(!argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
+    }
+
+    #[tokio::test]
+    async fn codex_fork_reads_the_version_of_the_codex_it_launches() {
+        // The app's adapter reports no version, which would pass the flag; the
+        // Codex the fork launches predates it.
+        let argv = codex_fork_argv(Some("codex-cli 0.168.0"), |_| String::new()).await;
+        assert!(!argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
+    }
+
+    #[tokio::test]
+    async fn codex_fork_reads_the_version_in_the_project_folder() {
+        // A version manager's shim can launch an older Codex in the project
+        // folder than the one Switchboard's own folder gets.
+        let answer = "if [ -e .codex-0.168 ]; then echo 'codex-cli 0.168.0'; else echo 'codex-cli 0.170.0'; fi";
+        let argv = codex_fork_argv_answering(answer, |folder| {
+            std::fs::write(folder.join(".codex-0.168"), "").unwrap();
+            String::new()
+        })
+        .await;
+        assert!(!argv.iter().any(|arg| arg == "--trust"), "{argv:?}");
+    }
+
+    #[tokio::test]
+    async fn codex_fork_passes_trust_only_to_codex_0_169_0_or_newer_or_an_unreadable_version() {
+        for (version_line, trust) in [
+            (Some("codex-cli 0.168.0"), false),
+            (Some("codex-cli 0.169.0"), true),
+            (None, true),
+        ] {
+            let argv = codex_fork_argv(version_line, |_| String::new()).await;
+            assert_eq!(
+                argv.iter().any(|arg| arg == "--trust"),
+                trust,
+                "{version_line:?}: {argv:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn codex_fork_creation_failure_registers_nothing() {
         let (_tmp, home, state, project_id) = codex_fork_state();
@@ -9234,6 +9351,43 @@ mod tests {
         assert!(
             matches!(&err, AppError::ForkSourceBusy { name } if name == "cx"),
             "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_fork_with_no_codex_on_the_path_fails_as_not_installed() {
+        // The parent's lock is held elsewhere, so a fork that looked for Codex
+        // only after taking the lock would report the parent as busy instead.
+        let (_tmp, home, state, project_id) = codex_fork_state();
+        let source_id = seed_codex_source(&state, home.path(), "cx");
+        let _contender = crate::session_lock::acquire_session_locks(
+            &state.lock_root,
+            &BTreeSet::from([codex_parent_key(&state, project_id)]),
+        )
+        .unwrap();
+        let before = lock(&state.agents_by_id).len();
+
+        let err = fork_agent_with(
+            &state,
+            source_id,
+            home.path(),
+            Path::new("switchboard-test-codex-not-on-any-path"),
+            path_settled(),
+        )
+        .await
+        .expect_err("a fork with no Codex to run must fail");
+
+        assert!(
+            matches!(
+                err,
+                AppError::CodexFork(switchboard_harness::CodexForkError::BinaryNotFound)
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            lock(&state.agents_by_id).len(),
+            before,
+            "a failed fork must not leave an agent behind"
         );
     }
 

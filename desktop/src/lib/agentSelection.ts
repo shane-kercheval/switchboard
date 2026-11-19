@@ -46,8 +46,8 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   /// Claude's self-upgrading `Opus`. Which generations are offered, and why,
   /// is recorded in `harness-behavior.md` §3.3.
   codex: [
-    { label: "GPT-6 Astra", value: "gpt-6-astra" },
-    { label: "GPT-6.1 Sol", value: "gpt-6.1-sol" },
+    { label: "GPT-6.2 Astra", value: "gpt-6.2-astra" },
+    { label: "GPT-6.2 Sol", value: "gpt-6.2-sol" },
     { label: "GPT-6.1 Terra", value: "gpt-6.1-terra" },
     { label: "GPT-6 Luna", value: "gpt-6-luna" },
   ],
@@ -136,7 +136,7 @@ export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> =
 
 /// Per-harness effort options offered by Switchboard. Codex also accepts `none`
 /// and `minimal` on some older models, but neither is offered: both are unused in
-/// practice and GPT-6 Astra rejects them. Effort validity is additionally
+/// practice and Codex's catalog lists neither for any model in the picker. Effort validity is additionally
 /// **per-model** for Antigravity (see `effortOptionsFor`), so a form scoped to a
 /// chosen model must derive its options through that helper rather than reading
 /// this map directly — an Antigravity model can have no effort axis at all (agy
@@ -238,9 +238,9 @@ export const DEFAULT_AGENT_SELECTIONS: Preferences["agent_defaults"] = {
     default_effort: "medium",
   },
   codex: {
-    model_choices: ["gpt-6.1-sol", "gpt-6.1-terra"],
+    model_choices: ["gpt-6.2-sol", "gpt-6.1-terra"],
     effort_choices: ["medium", "high"],
-    default_model: "gpt-6.1-sol",
+    default_model: "gpt-6.2-sol",
     default_effort: "medium",
   },
   // Both carry explicit effort because the window's pickers always store one

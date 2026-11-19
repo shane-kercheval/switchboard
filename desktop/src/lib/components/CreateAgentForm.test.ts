@@ -226,9 +226,9 @@ describe("CreateAgentForm", () => {
       name: "codex",
       harness: "codex",
       selection: {
-        model: "gpt-6.1-sol",
+        model: "gpt-6.2-sol",
         effort: "medium",
-        model_choices: ["gpt-6.1-sol", "gpt-6.1-terra"],
+        model_choices: ["gpt-6.2-sol", "gpt-6.1-terra"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
@@ -581,7 +581,7 @@ describe("CreateAgentForm", () => {
   it("create + Codex: pickers preselect the configured default", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-codex"));
-    expect(pickerValue("model-select")).toBe("gpt-6.1-sol");
+    expect(pickerValue("model-select")).toBe("gpt-6.2-sol");
     expect(pickerValue("effort-select")).toBe("medium");
   });
 
@@ -730,16 +730,16 @@ describe("CreateAgentForm", () => {
     await choosePicker("model-select", "haiku");
     await fireEvent.click(screen.getByTestId("harness-codex"));
     // The stale Claude value is gone — Codex shows its own default.
-    expect(pickerValue("model-select")).toBe("gpt-6.1-sol");
+    expect(pickerValue("model-select")).toBe("gpt-6.2-sol");
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
       name: "codex",
       harness: "codex",
       selection: {
-        model: "gpt-6.1-sol",
+        model: "gpt-6.2-sol",
         effort: "medium",
-        model_choices: ["gpt-6.1-sol", "gpt-6.1-terra"],
+        model_choices: ["gpt-6.2-sol", "gpt-6.1-terra"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
@@ -846,9 +846,9 @@ describe("CreateAgentForm", () => {
       name: "my-thing",
       harness: "codex",
       selection: {
-        model: "gpt-6.1-sol",
+        model: "gpt-6.2-sol",
         effort: "medium",
-        model_choices: ["gpt-6.1-sol", "gpt-6.1-terra"],
+        model_choices: ["gpt-6.2-sol", "gpt-6.1-terra"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);

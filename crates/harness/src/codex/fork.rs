@@ -37,8 +37,8 @@ use switchboard_core::AgentSelection;
 use tokio::io::AsyncBufReadExt;
 use tokio_util::sync::CancellationToken;
 
-use super::CodexLocator;
 use super::session_file::{AttachLookupError, find_codex_session_file_for_attach};
+use super::{CodexLocator, CodexRunFlags};
 
 /// Production bound for creating a fork.
 ///
@@ -132,9 +132,8 @@ fn exit_description(code: Option<i32>) -> String {
 /// `selection` is passed as the same `-m` / `-c model_reasoning_effort=` flags a
 /// dispatch sends, so the fork's recorded settings match the agent the caller
 /// registers. `home_dir` is where the new rollout is looked up
-/// (`<home_dir>/.codex/sessions`). `own_server_overrides` are the `-c` flags
-/// from [`super::codex_own_server_overrides`], placed with the other flags as
-/// on a dispatch.
+/// (`<home_dir>/.codex/sessions`). `flags` come from
+/// [`CodexRunFlags::for_run`] for `cwd`, as on a dispatch.
 ///
 /// **The partition date comes from where Codex wrote the file**, not from
 /// today's date. A creation that crossed midnight would otherwise look in the
@@ -165,12 +164,17 @@ pub async fn fork_codex_session(
     cwd: &Path,
     parent_thread_id: &str,
     selection: &AgentSelection,
-    own_server_overrides: &[String],
+    flags: &CodexRunFlags,
     timeout: Duration,
 ) -> Result<CodexLocator, CodexForkError> {
     let binary = binary.to_owned();
     let cwd = cwd.to_owned();
-    let args = fork_args(parent_thread_id, selection, own_server_overrides);
+    let args = fork_args(
+        parent_thread_id,
+        selection,
+        &flags.own_server_overrides,
+        flags.trust,
+    );
     let cancel = CancellationToken::new();
     let task = tokio::spawn({
         let cancel = cancel.clone();
@@ -210,19 +214,21 @@ pub async fn fork_codex_session(
 /// `-C .` with the child's working directory set to the project folder, as a
 /// first-turn dispatch does: `.` resolves against the child's cwd, so the path
 /// is not encoded twice. `overrides` are `-c` pairs, among the flags.
+/// `trust` adds `--trust`, as on a turn.
 fn fork_args(
     parent_thread_id: &str,
     selection: &AgentSelection,
     overrides: &[String],
+    trust: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "exec".to_owned(),
         "--json".to_owned(),
         "--skip-git-repo-check".to_owned(),
         "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-        "-C".to_owned(),
-        ".".to_owned(),
     ];
+    super::push_trust_flag(&mut args, trust);
+    args.extend(["-C".to_owned(), ".".to_owned()]);
     super::push_selection_flags(
         &mut args,
         selection.model.as_deref(),
@@ -451,12 +457,13 @@ mod tests {
             ..AgentSelection::default()
         };
         assert_eq!(
-            fork_args("parent-id", &selection, &[]),
+            fork_args("parent-id", &selection, &[], true),
             [
                 "exec",
                 "--json",
                 "--skip-git-repo-check",
                 "--dangerously-bypass-approvals-and-sandbox",
+                "--trust",
                 "-C",
                 ".",
                 "-m",
@@ -475,7 +482,7 @@ mod tests {
             "-c".to_owned(),
             "mcp_servers.switchboard.enabled=false".to_owned(),
         ];
-        let args = fork_args("parent-id", &AgentSelection::default(), &overrides);
+        let args = fork_args("parent-id", &AgentSelection::default(), &overrides, true);
         assert_eq!(
             args[args.len() - 4..],
             [
@@ -488,8 +495,14 @@ mod tests {
     }
 
     #[test]
+    fn args_omit_trust_when_told_to() {
+        let args = fork_args("parent-id", &AgentSelection::default(), &[], false);
+        assert!(!args.contains(&"--trust".to_owned()), "{args:?}");
+    }
+
+    #[test]
     fn args_omit_selection_flags_that_are_unset() {
-        let args = fork_args("parent-id", &AgentSelection::default(), &[]);
+        let args = fork_args("parent-id", &AgentSelection::default(), &[], true);
         assert!(!args.iter().any(|arg| arg == "-m" || arg == "-c"));
         assert_eq!(args[args.len() - 2..], ["fork", "parent-id"]);
     }

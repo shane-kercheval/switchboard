@@ -3861,34 +3861,42 @@ async fn live_antigravity_tool_result_steps_follow_the_call_index() {
         let (outcome, content) = run_multi_tool_step_probe().await;
         let (expected, observed) = step_pairs(&content);
 
-        if expected.len() < 2 {
-            if attempt == 1 && is_benign_merge(&outcome, &content) {
-                eprintln!(
-                    "live_antigravity: model merged both jobs into one run_command; \
-                     retrying once to exercise the multi-call invariant"
-                );
-                continue;
+        if expected.len() >= 2 {
+            assert_eq!(
+                observed, expected,
+                "tool result steps must be `planner_step + 1 + call_index`; if this fails, \
+                 agy's step numbering changed and tool results will attach to the wrong call. \
+                 transcript: {content}"
+            );
+            match check_call_outputs(&content) {
+                CallOutputs::Paired => return,
+                CallOutputs::Mismatch(mismatch) => panic!(
+                    "each tool result must hold its own call's output, or tool results attach \
+                     to the wrong call; {mismatch}. transcript: {content}"
+                ),
+                // Every call's result is on its step, so the model chose other
+                // tools than the two asked for; nothing was lost.
+                CallOutputs::NothingToCheck if attempt == 1 => {
+                    eprintln!(
+                        "live_antigravity: no echo-only command and file-read call to \
+                         compare; retrying once to exercise the multi-call invariant"
+                    );
+                    continue;
+                }
+                CallOutputs::NothingToCheck => {}
             }
-            panic!(
-                "multi-tool precondition not exercised after retry \
-                 (expected >= 2 tool calls, saw {}; outcome {outcome:?}); transcript: {content}",
-                expected.len()
+        } else if attempt == 1 && is_benign_merge(&outcome, &content) {
+            eprintln!(
+                "live_antigravity: model merged both jobs into one run_command; \
+                 retrying once to exercise the multi-call invariant"
             );
+            continue;
         }
-
-        assert_eq!(
-            observed, expected,
-            "tool result steps must be `planner_step + 1 + call_index`; if this fails, \
-             agy's step numbering changed and tool results will attach to the wrong call. \
-             transcript: {content}"
+        panic!(
+            "multi-tool precondition not exercised: needs an echo command and a file read as \
+             separate tool calls, saw {} tool calls; outcome {outcome:?}; transcript: {content}",
+            expected.len()
         );
-        if let Some(mismatch) = call_output_mismatch(&content) {
-            panic!(
-                "each tool result must hold its own call's output, or tool results attach \
-                 to the wrong call; {mismatch}. transcript: {content}"
-            );
-        }
-        return;
     }
     unreachable!("loop returns or panics on the final attempt")
 }
@@ -4120,12 +4128,50 @@ fn step_pairs(content: &str) -> (Vec<i64>, Vec<i64>) {
     (expected, observed)
 }
 
-/// The first call whose result, at `planner_step + 1 + call_index`, lacks its
-/// own output or holds the other call's: the echo's result must show the echo
-/// token and not the file's text, the read's the reverse. A call whose
-/// arguments name both sentinels or neither is skipped, but at least one echo
-/// and one read must be checked.
-fn call_output_mismatch(content: &str) -> Option<String> {
+/// Which of the two probe jobs a call does. Read from the call's command or
+/// path argument only, because the model-written `toolSummary` can name both
+/// sentinels.
+#[derive(Debug, Clone, Copy)]
+enum ProbeJob {
+    /// A `run_command` that echoes the token and doesn't touch the file.
+    Echo,
+    /// A file-read tool call on the probe file.
+    Read,
+}
+
+fn probe_job(call: &serde_json::Value) -> Option<ProbeJob> {
+    let arg = |name: &str| call["args"][name].as_str().unwrap_or_default();
+    match call["name"].as_str()? {
+        "run_command" => {
+            let command = arg("CommandLine");
+            (command.contains(STEP_PROBE_ECHO_TOKEN) && !command.contains(STEP_PROBE_FILE))
+                .then_some(ProbeJob::Echo)
+        }
+        "read_file" => arg("Path")
+            .contains(STEP_PROBE_FILE)
+            .then_some(ProbeJob::Read),
+        "view_file" => arg("AbsolutePath")
+            .contains(STEP_PROBE_FILE)
+            .then_some(ProbeJob::Read),
+        _ => None,
+    }
+}
+
+/// What `check_call_outputs` found.
+#[derive(Debug)]
+enum CallOutputs {
+    /// The echo and the read each show their own output at their result step.
+    Paired,
+    /// A call's result lacks its own output or holds the other call's.
+    Mismatch(String),
+    /// The turn has no echo call or no read call, so there is nothing to compare.
+    NothingToCheck,
+}
+
+/// Checks the result at `planner_step + 1 + call_index` of each echo and read
+/// call: the echo's must show the echo token and not the file's text, the
+/// read's the reverse.
+fn check_call_outputs(content: &str) -> CallOutputs {
     let records: Vec<serde_json::Value> = transcript_records(content).collect();
     let output_at = |step: i64| {
         records
@@ -4146,25 +4192,21 @@ fn call_output_mismatch(content: &str) -> Option<String> {
             .map(Vec::as_slice)
             .unwrap_or_default();
         for (index, call) in calls.iter().enumerate() {
-            let args = call["args"].to_string();
-            let (own, other) = match (
-                args.contains(STEP_PROBE_ECHO_TOKEN),
-                args.contains(STEP_PROBE_FILE),
-            ) {
-                (true, false) => {
+            let (own, other) = match probe_job(call) {
+                Some(ProbeJob::Echo) => {
                     echo_checked = true;
                     (STEP_PROBE_ECHO_TOKEN, STEP_PROBE_FILE_TEXT)
                 }
-                (false, true) => {
+                Some(ProbeJob::Read) => {
                     read_checked = true;
                     (STEP_PROBE_FILE_TEXT, STEP_PROBE_ECHO_TOKEN)
                 }
-                _ => continue,
+                None => continue,
             };
             let result_step = step + 1 + i64::try_from(index).unwrap();
             let output = output_at(result_step);
             if !output.contains(own) || output.contains(other) {
-                return Some(format!(
+                return CallOutputs::Mismatch(format!(
                     "{} called at step {step} should show {own:?} at step {result_step}, \
                      which holds {output:?}",
                     call["name"]
@@ -4172,63 +4214,72 @@ fn call_output_mismatch(content: &str) -> Option<String> {
             }
         }
     }
-    (!(echo_checked && read_checked)).then(|| {
-        format!("expected an echo call and a read call; echo: {echo_checked}, read: {read_checked}")
-    })
+    if echo_checked && read_checked {
+        CallOutputs::Paired
+    } else {
+        CallOutputs::NothingToCheck
+    }
 }
 
-/// Guards `call_output_mismatch`, which the live step test relies on to notice
+/// Guards `check_call_outputs`, which the live step test relies on to notice
 /// traded results. Not `#[ignore]`d, for the reason given on
 /// `benign_merge_requires_positive_evidence_of_both_jobs`.
 #[test]
-fn call_output_mismatch_catches_traded_results() {
-    fn transcript(echo_output: &str, read_output: &str) -> String {
-        [
-            json!({
-                "step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
-                "tool_calls": [
-                    {"name": "run_command", "args": {"CommandLine": "\"echo STEP_PROBE_ONE\""}},
-                    {"name": "view_file", "args": {"AbsolutePath": "\"/w/STEP_PROBE.txt\""}},
-                ],
-            }),
-            json!({"step_index": 3, "source": "MODEL", "type": "RUN_COMMAND", "content": echo_output}),
-            json!({"step_index": 4, "source": "MODEL", "type": "VIEW_FILE", "content": read_output}),
-        ]
-        .map(|record| record.to_string())
-        .join("\n")
-    }
-
-    assert_eq!(
-        call_output_mismatch(&transcript(
-            "Output:\nSTEP_PROBE_ONE\n",
-            "1: step probe fixture\n"
-        )),
-        None
-    );
-    assert!(
-        call_output_mismatch(&transcript(
-            "1: step probe fixture\n",
-            "Output:\nSTEP_PROBE_ONE\n"
-        ))
-        .is_some(),
-        "traded results must be caught"
-    );
-    assert!(
-        call_output_mismatch(&transcript("Output:\n\n", "1: step probe fixture\n")).is_some(),
-        "a result missing its own output must be caught"
-    );
-    let echo_only = [
-        json!({
+fn check_call_outputs_catches_traded_results() {
+    // Every call carries a summary naming both sentinels, as a model may write.
+    const SUMMARY: &str = "\"Echo STEP_PROBE_ONE and read STEP_PROBE.txt\"";
+    fn transcript(calls: &serde_json::Value, outputs: &[&str]) -> String {
+        let planner = json!({
             "step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
-            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "\"echo STEP_PROBE_ONE\""}}],
-        }),
-        json!({"step_index": 3, "source": "MODEL", "type": "RUN_COMMAND", "content": "STEP_PROBE_ONE"}),
-    ]
-    .map(|record| record.to_string())
-    .join("\n");
+            "tool_calls": calls,
+        });
+        std::iter::once(planner.to_string())
+            .chain((3..).zip(outputs).map(|(step, output)| {
+                json!({"step_index": step, "source": "MODEL", "type": "GENERIC", "content": output})
+                    .to_string()
+            }))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    let echo_and_read = json!([
+        {"name": "run_command", "args": {"CommandLine": "\"echo STEP_PROBE_ONE\"", "toolSummary": SUMMARY}},
+        {"name": "read_file", "args": {"Path": "\"/w/STEP_PROBE.txt\"", "toolSummary": SUMMARY}},
+    ]);
+    let echo_output = "Output:\nSTEP_PROBE_ONE\n";
+    let read_output = "1: step probe fixture\n";
+
+    let paired = check_call_outputs(&transcript(&echo_and_read, &[echo_output, read_output]));
+    assert!(matches!(paired, CallOutputs::Paired), "{paired:?}");
+    let traded = check_call_outputs(&transcript(&echo_and_read, &[read_output, echo_output]));
     assert!(
-        call_output_mismatch(&echo_only).is_some(),
-        "a turn with no read call checked nothing"
+        matches!(traded, CallOutputs::Mismatch(_)),
+        "traded results must be caught: {traded:?}"
+    );
+    let missing = check_call_outputs(&transcript(&echo_and_read, &["Output:\n\n", read_output]));
+    assert!(
+        matches!(missing, CallOutputs::Mismatch(_)),
+        "a result missing its own output must be caught: {missing:?}"
+    );
+
+    let echo_only = json!([
+        {"name": "run_command", "args": {"CommandLine": "\"echo STEP_PROBE_ONE\"", "toolSummary": SUMMARY}},
+    ]);
+    let nothing = check_call_outputs(&transcript(&echo_only, &[echo_output]));
+    assert!(
+        matches!(nothing, CallOutputs::NothingToCheck),
+        "a turn with no read call has nothing to compare: {nothing:?}"
+    );
+    let merged = json!([
+        {"name": "run_command", "args": {"CommandLine": "\"echo STEP_PROBE_ONE; cat STEP_PROBE.txt\""}},
+        {"name": "list_dir", "args": {"DirectoryPath": "\"/w\""}},
+    ]);
+    let nothing = check_call_outputs(&transcript(
+        &merged,
+        &["STEP_PROBE_ONE\nstep probe fixture\n", "STEP_PROBE.txt"],
+    ));
+    assert!(
+        matches!(nothing, CallOutputs::NothingToCheck),
+        "a merged command is neither an echo nor a read: {nothing:?}"
     );
 }
 
@@ -5255,7 +5306,6 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
         ack_then_done_in_separate_replies(&live_items),
         "the live turn must say ack, then done in a later reply; got {live_items:?}"
     );
-    let live_reply = live_items.concat();
     let conversation_id = antigravity_capture(&events).expect("captured conversation id");
     let hydrated =
         load_antigravity_transcript(&home_dir(), cwd.path(), Some(conversation_id), agent.id)
@@ -5289,15 +5339,10 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
             _ => None,
         })
         .collect();
-    assert!(
-        ack_then_done_in_separate_replies(&reopened_items),
-        "the reopened turn must say ack, then done in a later reply; got {reopened_items:?}"
-    );
-    let reopened_reply = reopened_items.concat();
     assert_eq!(
-        reopened_reply.split_whitespace().collect::<Vec<_>>(),
-        live_reply.split_whitespace().collect::<Vec<_>>(),
-        "reopening must show the replies the live view showed"
+        reopened_items, live_items,
+        "reopening must show the replies the live view showed, with the same text, \
+         count and order"
     );
 }
 

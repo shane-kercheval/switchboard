@@ -115,14 +115,6 @@ export function claudeModelFamilyLabel(modelId: string): string {
   return modelId;
 }
 
-/// A per-harness choice between a segmented toggle and a dropdown for the model
-/// picker. No component reads it.
-export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> = {
-  claude_code: "segmented",
-  codex: "segmented",
-  antigravity: "segmented",
-};
-
 /// Per-harness effort options offered by Switchboard. Codex also accepts `none`
 /// and `minimal` on some older models, but neither is offered: both are unused in
 /// practice and Codex's catalog lists neither for any model in the picker. Effort validity is additionally

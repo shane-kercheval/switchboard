@@ -3874,9 +3874,12 @@ async fn live_antigravity_tool_result_steps_follow_the_call_index() {
                     "each tool result must hold its own call's output, or tool results attach \
                      to the wrong call; {mismatch}. transcript: {content}"
                 ),
-                // Every call's result is on its step, so the model chose other
-                // tools than the two asked for; nothing was lost.
-                CallOutputs::NothingToCheck if attempt == 1 => {
+                // Every call's result is on its step and the turn completed, so
+                // the model chose other tools than the two asked for. A turn that
+                // didn't complete falls through and fails at once.
+                CallOutputs::NothingToCheck
+                    if attempt == 1 && matches!(outcome, TurnOutcome::Completed) =>
+                {
                     eprintln!(
                         "live_antigravity: no echo-only command and file-read call to \
                          compare; retrying once to exercise the multi-call invariant"

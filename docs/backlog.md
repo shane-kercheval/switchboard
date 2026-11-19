@@ -143,7 +143,7 @@ Since Claude Code 2.1.277, the cost and token totals on a resumed turn's `result
   - Gemini 4 Argon with a default of `xhigh`. `agy models` lists Argon at `low`, `medium` and `high` only. Not probed.
 - To recover today, call `set_agent_model_and_effort` with `effort: null`, or switch the agent to another model in the window. The window offers the curated models plus the agent's quick choices, and the orchestrators are not curated. If the orchestrator is among the agent's quick choices, switching back to it clears the effort (`resolveModelChange`); if not, the window can't put the agent back on it. `create_agent` copies the quick choices from the Settings defaults.
 
-**Why it waits.** Reaching any of these needs an MCP caller to pass a model the pickers leave out, or a Settings default the model lacks, and no agent is known to be in this state. The fix makes the ops layer read the model table, which reverses the choice recorded in `harness-behavior.md` §3.4 that core does not enforce the per-model catalog.
+**Why it waits.** Reaching any of these needs an MCP caller to pass a model the pickers leave out, or a Settings default the model lacks, and no agent is known to be in this state. A fix touches only the app's ops layer: `create_agent` and `set_agent_model_and_effort` would load `antigravityModels.json`, which in Rust only a test module reads today, and apply the window's two rules. `switchboard-core` stays unchanged.
 
 **A candidate approach.** This is recorded, not decided. Apply `selectionForNewAgent` and `resolveModelChange` in the ops layer, from the same `antigravityModels.json`. Separately, the agent's selection editor could offer to clear an effort its model doesn't take, which would also repair agents already in this state.
 

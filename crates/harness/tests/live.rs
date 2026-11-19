@@ -3846,10 +3846,11 @@ async fn live_antigravity_dash_leading_prompt_completes() {
 /// ever shifts, tool results start attaching to the wrong call — silently, and
 /// with plausible-looking output — so this is worth a live turn.
 ///
-/// Uses a multi-tool prompt because a single-call turn cannot distinguish
-/// `P + 1 + call_index` from a simple "next step" rule. Also checks that each
-/// call's result step holds that call's own output, because the step lists
-/// alone would match if the two calls traded results.
+/// Needs both calls in one planner step, because a single call, or one call per
+/// step, has index 0 and cannot distinguish `P + 1 + call_index` from a simple
+/// "next step" rule. Also checks that each call's result step holds that call's
+/// own output, because the step lists alone would match if the two calls traded
+/// results.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 #[serial_test::serial(antigravity)]
@@ -3875,18 +3876,19 @@ async fn live_antigravity_tool_result_steps_follow_the_call_index() {
                      to the wrong call; {mismatch}. transcript: {content}"
                 ),
                 // Every call's result is on its step and the turn completed, so
-                // the model chose other tools than the two asked for. A turn that
-                // didn't complete falls through and fails at once.
-                CallOutputs::NothingToCheck
+                // the model chose other tools, or separate steps, for the two
+                // jobs. A turn that didn't complete falls through and fails at
+                // once.
+                CallOutputs::NotExercised
                     if attempt == 1 && matches!(outcome, TurnOutcome::Completed) =>
                 {
                     eprintln!(
-                        "live_antigravity: no echo-only command and file-read call to \
-                         compare; retrying once to exercise the multi-call invariant"
+                        "live_antigravity: no step held both an echo command and a file \
+                         read; retrying once to exercise the multi-call invariant"
                     );
                     continue;
                 }
-                CallOutputs::NothingToCheck => {}
+                CallOutputs::NotExercised => {}
             }
         } else if attempt == 1 && is_benign_merge(&outcome, &content) {
             eprintln!(
@@ -3897,7 +3899,8 @@ async fn live_antigravity_tool_result_steps_follow_the_call_index() {
         }
         panic!(
             "multi-tool precondition not exercised: needs an echo command and a file read as \
-             separate tool calls, saw {} tool calls; outcome {outcome:?}; transcript: {content}",
+             separate tool calls in one step, saw {} tool calls; outcome {outcome:?}; \
+             transcript: {content}",
             expected.len()
         );
     }
@@ -4041,21 +4044,24 @@ fn benign_merge_requires_positive_evidence_of_both_jobs() {
     assert!(!is_benign_merge(&TurnOutcome::Completed, ""));
 }
 
-/// Asks for one shell command and one file read, each as its own tool call.
+/// Asks for one shell command and one file read, each as its own tool call,
+/// issued together in one step.
 ///
-/// **This does not guarantee two calls, and must not be described as if it
-/// did.** `agy` has no flag to restrict which tools the model may use
+/// **This does not guarantee two calls in one step, and must not be described
+/// as if it did.** `agy` has no flag to restrict which tools the model may use
 /// (checked @ 1.1.20: only `--dangerously-skip-permissions` and
 /// `--disable-slash-commands` exist), so the model can always satisfy both
 /// jobs with a single `run_command` running `echo …; cat STEP_PROBE.txt` — the
 /// same merge that made an earlier "two shell commands" version flaky. Naming
 /// the tools and forbidding the shell read makes the merge unlikely, not
-/// impossible; the caller retries once and then fails loudly.
+/// impossible, and the model can still issue the two calls in separate steps;
+/// the caller retries once and then fails loudly.
 ///
 /// The deterministic proof of the step invariant lives in the fixture tests
 /// (`tool-failure-cross-planner`, `tool-vocabulary`). This live test exists
 /// only to catch the real CLI renumbering its steps.
-const MULTI_TOOL_PROMPT: &str = "Do exactly two things, using a separate tool call for each. \
+const MULTI_TOOL_PROMPT: &str = "Do exactly two things, using a separate tool call for each, \
+     and issue both tool calls together in the same step. \
      First, use your shell-command tool to run: echo STEP_PROBE_ONE \
      Second, use your file-reading tool to read the file STEP_PROBE.txt in the workspace \
      directory. Do not read that file with the shell. \
@@ -4167,13 +4173,14 @@ enum CallOutputs {
     Paired,
     /// A call's result lacks its own output or holds the other call's.
     Mismatch(String),
-    /// The turn has no echo call or no read call, so there is nothing to compare.
-    NothingToCheck,
+    /// No planner step holds both an echo call and a read call, so no second
+    /// call of a step was checked.
+    NotExercised,
 }
 
 /// Checks the result at `planner_step + 1 + call_index` of each echo and read
 /// call: the echo's must show the echo token and not the file's text, the
-/// read's the reverse.
+/// read's the reverse. Paired needs one planner step holding both calls.
 fn check_call_outputs(content: &str) -> CallOutputs {
     let records: Vec<serde_json::Value> = transcript_records(content).collect();
     let output_at = |step: i64| {
@@ -4187,8 +4194,9 @@ fn check_call_outputs(content: &str) -> CallOutputs {
             .and_then(|r| r["content"].as_str())
             .unwrap_or_default()
     };
-    let (mut echo_checked, mut read_checked) = (false, false);
+    let mut batched = false;
     for record in records.iter().filter(|r| r["type"] == "PLANNER_RESPONSE") {
+        let (mut echo_checked, mut read_checked) = (false, false);
         let step = record["step_index"].as_i64().unwrap_or_default();
         let calls = record["tool_calls"]
             .as_array()
@@ -4216,11 +4224,12 @@ fn check_call_outputs(content: &str) -> CallOutputs {
                 ));
             }
         }
+        batched |= echo_checked && read_checked;
     }
-    if echo_checked && read_checked {
+    if batched {
         CallOutputs::Paired
     } else {
-        CallOutputs::NothingToCheck
+        CallOutputs::NotExercised
     }
 }
 
@@ -4269,7 +4278,7 @@ fn check_call_outputs_catches_traded_results() {
     ]);
     let nothing = check_call_outputs(&transcript(&echo_only, &[echo_output]));
     assert!(
-        matches!(nothing, CallOutputs::NothingToCheck),
+        matches!(nothing, CallOutputs::NotExercised),
         "a turn with no read call has nothing to compare: {nothing:?}"
     );
     let merged = json!([
@@ -4281,8 +4290,30 @@ fn check_call_outputs_catches_traded_results() {
         &["STEP_PROBE_ONE\nstep probe fixture\n", "STEP_PROBE.txt"],
     ));
     assert!(
-        matches!(nothing, CallOutputs::NothingToCheck),
+        matches!(nothing, CallOutputs::NotExercised),
         "a merged command is neither an echo nor a read: {nothing:?}"
+    );
+
+    // Each call alone in its own step has index 0, so the batch rule went
+    // unchecked even though both outputs are right.
+    let separate_steps = [
+        json!({
+            "step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "\"echo STEP_PROBE_ONE\""}}],
+        }),
+        json!({"step_index": 3, "source": "MODEL", "type": "GENERIC", "content": echo_output}),
+        json!({
+            "step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+            "tool_calls": [{"name": "read_file", "args": {"Path": "\"/w/STEP_PROBE.txt\""}}],
+        }),
+        json!({"step_index": 5, "source": "MODEL", "type": "GENERIC", "content": read_output}),
+    ]
+    .map(|record| record.to_string())
+    .join("\n");
+    let unbatched = check_call_outputs(&separate_steps);
+    assert!(
+        matches!(unbatched, CallOutputs::NotExercised),
+        "calls in separate steps don't exercise the batch rule: {unbatched:?}"
     );
 }
 

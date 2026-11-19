@@ -41,7 +41,7 @@
       "value": "gpt-oss-120b",
       "label": "GPT-OSS 120B",
       "efforts": ["medium"],
-      "reason": "The picker offers only Gemini 4 Neon and Hydrogen, and Hydrogen covers fast, cheap work."
+      "reason": "The picker offers only current Google models, and GPT-OSS 120B is not a Google model."
     },
     {
       "value": "gemini-pro-orchestrator-neon",

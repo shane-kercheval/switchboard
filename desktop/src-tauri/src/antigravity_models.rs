@@ -16,6 +16,7 @@ use std::process::{Command, Stdio};
 use futures::StreamExt;
 use serde::Deserialize;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
+use switchboard_harness::antigravity::EFFORT_LEVELS;
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, DispatchOptions, HarnessAdapter, Turn, TurnOutcome,
     load_antigravity_transcript,
@@ -25,11 +26,6 @@ use uuid::Uuid;
 use crate::preferences::Preferences;
 
 const TABLE: &str = include_str!("../../src/lib/antigravityModels.json");
-
-/// The levels `agy --help` lists for `--effort` (1.4.2). A trailing
-/// parenthetical in a model's label is a folded level only when it names one
-/// of these; anything else, like 1.1.19's `(Thinking)`, is part of the name.
-const CLI_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// Each model's effort levels, `None` for a model that takes no `--effort`.
 type Catalog = BTreeMap<String, Option<BTreeSet<String>>>;
@@ -124,11 +120,13 @@ fn cli_catalog(stdout: &str) -> Result<Catalog, serde_json::Error> {
     Ok(catalog)
 }
 
-/// The base model and level of a folded entry, or `None` for a bare one.
+/// The base model and level of a folded entry, or `None` for a bare one. A
+/// trailing parenthetical is a folded level only when it names one of
+/// [`EFFORT_LEVELS`]; anything else, like `(Thinking)`, is part of the name.
 fn folded_level<'a>(id: &'a str, label: &str) -> Option<(&'a str, String)> {
     let (_, suffix) = label.strip_suffix(')')?.rsplit_once(" (")?;
     let level = suffix.to_lowercase();
-    if !CLI_EFFORT_LEVELS.contains(&level.as_str()) {
+    if !EFFORT_LEVELS.contains(&level.as_str()) {
         return None;
     }
     let base = id.strip_suffix(level.as_str())?.strip_suffix('-')?;

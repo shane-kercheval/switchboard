@@ -1044,6 +1044,50 @@ mod tests {
         assert_eq!(agent_status(&transcript.turns[1]), TurnStatus::Complete);
     }
 
+    /// Captured from agy 1.5.12 after `--print-timeout 15s` killed a background
+    /// `sleep 40` (exit 3). The transcript records no failure, so reopening
+    /// shows the partial reply once; the failure comes from the journal's
+    /// outcome marker, which the merge renders after the turn.
+    #[test]
+    fn a_print_timeout_turn_reopens_with_its_partial_reply_once() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-19T22:08:28Z","content":"<USER_REQUEST>\nStart the shell command `sleep 40` as a background command, so you do not wait for it. As soon as it has started, reply with only the word ack.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-19T16:08:28-06:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Hydrogen (Medium). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T22:08:28Z","model":"gemini-4-hydrogen-medium","input_tokens":10481,"cache_read_tokens":0,"output_tokens":205,"thinking":"I'm thinking through how to approach this.\n\n\n","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"sleep 40\"","IsDaemon":"false","WaitMsBeforeAsync":"500","toolSummary":"\"Run sleep 40 in background\""}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","created_at":"2026-11-19T22:08:31Z","content":"Created At: 2026-11-19T16:08:31-06:00\nTool is running as a background task with task id: 5e501181-8934-4fc5-9495-bfe050ceaccc/task-2\nTask Description: sleep 40\nTask logs are available at: file:///Users/me/.gemini/antigravity-cli/brain/5e501181-8934-4fc5-9495-bfe050ceaccc/.system_generated/tasks/task-2.log\nYOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: A) either proceed to other relevant work (if any) or, B) simply update the user with a short message (that you have launched the command and will wait for it to finish) and end the turn.\n DO NOTHING ELSE."}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T22:08:31Z","model":"gemini-4-hydrogen-medium","input_tokens":2450,"cache_read_tokens":8427,"output_tokens":42,"content":"ack"}"#,
+            "\n",
+        );
+        let transcript = parse_antigravity_transcript_content(content, agent_id());
+        assert!(transcript.warnings.is_empty(), "{:?}", transcript.warnings);
+        assert_eq!(transcript.turns.len(), 2, "{:?}", transcript.turns);
+        assert!(
+            user_turn_text(&transcript.turns[0]).starts_with("Start the shell command `sleep 40`")
+        );
+        let items = agent_items(&transcript.turns[1]);
+        let replies: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Text {
+                    kind: ContentKind::Text,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, vec!["ack"]);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, TurnItem::Tool { name, .. } if name == "run_command"))
+                .count(),
+            1,
+            "{items:?}"
+        );
+    }
+
     /// Synthetic: a failure whose status the parser does not list (`REJECTED`
     /// is not among the binary's step statuses @ 1.4.9 or 1.4.10). Reopening
     /// must show it as failed on its `error` alone, as the live view does.

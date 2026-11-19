@@ -59,13 +59,12 @@
 //!   a "produced output" liveness signal — *not* a success signal, since a turn
 //!   is `Completed` only on a transcript terminal answer.
 //! - **Auth fast-fail.** When the keyring token is stale, `agy -p` falls
-//!   back to interactive OAuth: it prints `Authentication required...`,
-//!   opens a browser, and blocks ~30s before timing out. There is no flag
-//!   to suppress this. The adapter watches **both stdout and stderr** for that
-//!   line (1.1.x moved its diagnostics to stderr; whether the auth line moved
-//!   with them is unverified, so both are watched), force-kills immediately,
-//!   and emits `AuthFailure` — bounding the hang. (The browser tab cannot be
-//!   prevented; documented as a known limitation.)
+//!   back to interactive OAuth: it prints `Authentication required...` on
+//!   stderr (verified @ 1.5.12), opens a browser, and waits 60 s for a
+//!   sign-in before it exits 1. There is no flag to suppress this. The adapter
+//!   watches **both stdout and stderr** for that line, force-kills
+//!   immediately, and emits `AuthFailure`, bounding the wait. (The browser tab
+//!   cannot be prevented; documented as a known limitation.)
 //!
 //! Ground-truth reference: `docs/research/archive/antigravity-cli-observed.md`.
 
@@ -150,18 +149,17 @@ const POST_EXIT_DRAIN_CAP: usize = 1 << 20;
 /// `attempt 0` reads immediately; the rest are spaced `POLL_INTERVAL` apart.
 const FINAL_DRAIN_ATTEMPTS: u32 = 6;
 
-/// Value passed to `agy --print-timeout`. `agy`'s default is `5m`, and it is a
-/// whole-turn wall-clock cap (probe-confirmed) — not just an initial-response
-/// wait — so a long-but-actively-working turn (e.g. a PR review running a test
-/// suite) gets killed mid-flight with `Error: timed out waiting for response`.
-/// The dispatcher imposes no turn deadline and the other three harnesses have
-/// no built-in cap, so we override `agy`'s default with a generous value to
-/// match that posture. `0` is NOT a disable sentinel — it means zero-wait and
-/// times out immediately — so a large finite value is used; `24h` never cuts a
-/// real turn yet still eventually reaps a truly-wedged `agy` rather than leaking
-/// it. (An automatic backstop for a zero-progress wedge, if ever wanted, belongs
-/// in the dispatcher for every adapter, not as an Antigravity-only timer.)
+/// Value passed to `agy --print-timeout`, a whole-turn cap. `agy`'s own default
+/// (`0`) is no limit, and `-p` waits for background commands, so a command that
+/// never ends would hold the turn forever. At the cap `agy` kills those commands
+/// and reports `finished_reason: "print_timeout"`, which `classify_outcome`
+/// fails.
 const PRINT_TIMEOUT: &str = "24h";
+
+/// The levels `agy --effort` accepts (`agy --help`). Which of them a model takes
+/// is per model (`desktop/src/lib/antigravityModels.json`); a level missing here
+/// makes its turns show the whole announcement as the model and no effort.
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// Verify a binary name is on PATH, mapping a miss to `BinaryNotFound`.
 /// Used by [`AntigravityAdapter::probe`]; factored out so the negative-path
@@ -436,16 +434,14 @@ fn build_args(
 ///
 /// `agy` 1.1.x moved its diagnostics from stdout to stderr, so stderr now
 /// carries two things the turn's outcome depends on: the `Authentication
-/// required…` line (which must force-kill the process before its ~30s OAuth
-/// block) and the `Error:` line naming the real failure. Neither may be read
+/// required…` line (which must force-kill the process before its 60-second
+/// sign-in wait) and the `Error:` line naming the real failure. Neither may be read
 /// back from the bounded stderr *tail*: that buffer is capped at
 /// [`crate::subprocess::STDERR_TAIL_CAPACITY`] and front-evicts, so a chatty
 /// burst after either line would drop it permanently — reinstating exactly the
-/// hang and the message-loss this adapter exists to prevent. Because the real
-/// 1.1.19 auth-failure output cannot be probed without logging the developer
-/// out, there is no evidence bounding how much `agy` prints around it, so
-/// "observed stderr is quiet" is an absence of counter-evidence, not a safety
-/// argument.
+/// hang and the message-loss this adapter exists to prevent. Nothing bounds how
+/// much `agy` prints around either line, so "observed stderr is quiet" is no
+/// safety argument.
 ///
 /// Both signals are therefore **sticky**: set once when first seen, never
 /// recomputed. The tail keeps its original job — the human-readable fallback
@@ -804,22 +800,16 @@ async fn run_producer(ctx: ProducerCtx) {
                 };
                 for line in lines {
                     if is_auth_failure_line(&line) {
-                        // Fast-fail: the OAuth fallback is mid-flight (browser
-                        // open, ~30s block ahead). Stop now and force-kill.
-                        // The same check runs against stderr on the poll tick
-                        // below — `agy` 1.1.x moved its diagnostics to stderr
-                        // and whether the auth line moved with them is
-                        // unverified (see the tick arm).
+                        // The OAuth fallback has opened a browser and waits 60 s
+                        // for a sign-in. The line arrives on stderr @ 1.5.12
+                        // (the tick arm below); this arm covers stdout.
                         auth_failed = true;
                         break 'turn;
                     }
                     // Stream-json first; anything that is not a stream
-                    // line falls through to the plain-text handlers below.
-                    // That fallthrough is deliberate rather than vestigial:
-                    // whether `agy` still prints its auth line and bare
-                    // `Error:` lines alongside the stream is unverified
-                    // (reproducing the auth shape needs a logged-out CLI),
-                    // so the pre-stream signals stay wired.
+                    // line falls through to the plain-text handlers below,
+                    // so an auth or `Error:` line printed to stdout by an
+                    // older or future `agy` is still caught.
                     if let Some(event) = stream::parse_line(&line) {
                         // Any parsed stream line proves the process is
                         // producing structured output — the liveness
@@ -923,21 +913,14 @@ async fn run_producer(ctx: ProducerCtx) {
                 }
             }
             _ = poll.tick() => {
-                // Mid-run auth watch on **stderr**, mirroring the stdout arm
-                // above. `agy` 1.1.x moved its diagnostics from stdout to
-                // stderr; whether the `Authentication required…` line moved
-                // with them is **unverified** — reproducing it requires
-                // logging the developer out, and the probe that attempted it
-                // disrupted a live session, so it was abandoned rather than
-                // retried. Watching both streams makes the answer moot: if the
-                // line still lands on stdout the arm above fires first, and if
-                // it moved here this bounds the ~30s OAuth block instead of
-                // letting the turn hang.
+                // Mid-run auth watch on **stderr**, where `agy` prints the
+                // `Authentication required…` line @ 1.5.12; without it the
+                // turn waits out `agy`'s 60-second sign-in wait.
                 //
                 // The flag is set by the drain task the moment the line is
                 // read, so unlike a scan of the bounded tail it cannot be lost
                 // to eviction (see `StderrSignals`). The only cost is up to one
-                // poll interval of latency, against a 30s hang.
+                // poll interval of latency, against a 60 s wait.
                 if !auth_failed && stderr_signals.auth_failed() {
                     auth_failed = true;
                     break;
@@ -1705,9 +1688,6 @@ fn extract_model_from_record(rec: &TranscriptRecord) -> Option<(String, Option<S
 /// is split off; any other stays part of the name, because for some models it
 /// *is* the name (`Claude Sonnet 4.6 (Thinking)`, `Orchestrator (Neon)`).
 fn split_announced_model(display: &str) -> (String, Option<String>) {
-    // The levels `agy --help` lists for `--effort`; a level missing here makes
-    // its turns show the whole announcement as the model and no effort.
-    const LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
     let Some((name, tail)) = display.rsplit_once(" (") else {
         return (display.to_owned(), None);
     };
@@ -1715,7 +1695,7 @@ fn split_announced_model(display: &str) -> (String, Option<String>) {
         return (display.to_owned(), None);
     };
     let level = inner.trim().to_ascii_lowercase();
-    if LEVELS.contains(&level.as_str()) {
+    if EFFORT_LEVELS.contains(&level.as_str()) {
         (name.trim().to_owned(), Some(level))
     } else {
         (display.to_owned(), None)
@@ -2004,7 +1984,21 @@ fn classify_outcome(
     // G17 in `harness-behavior.md` (observed on a since-removed harness),
     // and it leaves the no-answer cases (timeout, hard failure) failing as
     // they should. Residual risk mirrors G17's: a turn that genuinely failed
-    // *after* answering renders as success.
+    // *after* answering renders as success. A print timeout is the one such
+    // failure `agy` names, so it is failed first.
+    if let Some(result) = stream_result
+        && result.print_timeout
+    {
+        return TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message: result.error.clone().unwrap_or_else(|| {
+                format!(
+                    "Antigravity ended the turn at its {PRINT_TIMEOUT} limit while it waited \
+                     for a background command; the reply may be incomplete"
+                )
+            }),
+        };
+    }
     if let Some(result) = stream_result
         && !result.succeeded
         && !sig.saw_terminal_answer
@@ -3284,6 +3278,7 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
         let result = stream::StreamResult {
             succeeded: false,
             error: Some("model overloaded".to_owned()),
+            print_timeout: false,
         };
         match classify_outcome(
             &sig,
@@ -3307,7 +3302,9 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
         // ERROR when any tool call is rejected, even though the model
         // recovered and answered. Failing on that would mark ordinary agentic
         // turns as failed; the tool failure is already surfaced as a failed
-        // tool row from the same stream.
+        // tool row from the same stream. agy 1.5.12 also reports ERROR for a
+        // run that succeeded after it retried a model request (fixed in
+        // 1.5.13). Only a result that is not a print timeout yields.
         assert_eq!(
             classify_with_stream(
                 &ok_signals(),
@@ -3318,9 +3315,73 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
                          failed to read file: no such file or directory"
                             .to_owned()
                     ),
+                    print_timeout: false,
                 },
             ),
             TurnOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn classify_outcome_print_timeout_fails_a_turn_that_answered() {
+        // Captured from agy 1.5.12 run with `--print-timeout 15s` while a
+        // background `sleep 40` ran: the model had answered `ack`, then agy
+        // killed the command and exited 3. Ids and paths are scrubbed.
+        let id = "00000000-0000-0000-0000-000000000000";
+        let error = format!(
+            "print timeout after 15s while the agent was waiting on 1 background task(s); \
+             the response may be incomplete; terminated {id}/task-2 (sleep 40, running 12s)"
+        );
+        let result_line = format!(
+            r#"{{"event":"result","result":{{"conversation_id":"{id}","status":"ERROR","response":"ack\n","error":"{error}","duration_seconds":5.153743,"num_turns":1,"finished_reason":"print_timeout"}}}}"#
+        );
+        let Some(stream::StreamEvent::Result(result)) = stream::parse_line(&result_line) else {
+            panic!("the captured result line must parse");
+        };
+        let stderr = stderr_of(&[
+            "root agent idle; waiting up to 15s for 1 background task(s)",
+            "terminating 1 background task(s) on exit",
+            "[agy] print timeout after 15s with 1 background task(s) still running; terminating them",
+            &format!("error: {error}"),
+            &format!(
+                r#"AGY_ERROR: {{"short_error":"{error}","status":"DEADLINE_EXCEEDED","retryable":false,"reason":"print_timeout"}}"#
+            ),
+        ]);
+        let outcome = classify_outcome(
+            &ok_signals(),
+            &[],
+            Some(&result),
+            stderr.signals.auth_failed(),
+            stderr.signals.first_error(),
+            &stderr.tail,
+        );
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message: error,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_outcome_print_timeout_without_a_message_names_the_limit() {
+        let outcome = classify_with_stream(
+            &ok_signals(),
+            &stream::StreamResult {
+                succeeded: false,
+                error: None,
+                print_timeout: true,
+            },
+        );
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message: "Antigravity ended the turn at its 24h limit while it waited for a \
+                          background command; the reply may be incomplete"
+                    .to_owned(),
+            }
         );
     }
 
@@ -3338,6 +3399,7 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
             &stream::StreamResult {
                 succeeded: false,
                 error: Some("Authentication required. Please visit the URL".to_owned()),
+                print_timeout: false,
             },
         ) {
             TurnOutcome::Failed { kind, message } => {
@@ -3364,6 +3426,7 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
             &stream::StreamResult {
                 succeeded: true,
                 error: None,
+                print_timeout: false,
             },
         ) {
             TurnOutcome::Failed { kind, .. } => {
@@ -3381,6 +3444,7 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
                 &stream::StreamResult {
                     succeeded: true,
                     error: None,
+                    print_timeout: false,
                 },
             ),
             TurnOutcome::Completed
@@ -3400,6 +3464,7 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
         let result = stream::StreamResult {
             succeeded: false,
             error: None,
+            print_timeout: false,
         };
         match classify_outcome(
             &sig,

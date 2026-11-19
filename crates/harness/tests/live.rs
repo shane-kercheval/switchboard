@@ -5049,12 +5049,13 @@ async fn live_antigravity_model_change_announced_on_resume() {
 }
 
 /// `agy -p` waits for a background command before it exits, then writes a
-/// wake-up `SYSTEM_MESSAGE` and usually a second reply into the same
-/// conversation. This fails if reopening shows that turn differently from the
-/// live view (a user message for the wake-up, a split turn, a lost or doubled
-/// reply), or if `agy` stops waiting, which README and harness-behavior §6
-/// describe. Pinned to Gemini 4 Hydrogen, which starts the command in the
-/// background when asked.
+/// wake-up `SYSTEM_MESSAGE` and lets the model reply again in the same turn.
+/// The prompt asks for `ack` at the start and `done` after the wake-up, so this
+/// fails if the follow-up is lost or arrives after `TurnEnd`, if reopening
+/// shows the turn differently (a user message for the wake-up, a split turn, a
+/// lost or doubled reply), or if `agy` stops waiting, which README and
+/// harness-behavior §6 describe. Pinned to Gemini 4 Hydrogen, which starts the
+/// command in the background when asked.
 #[tokio::test]
 #[ignore = "requires antigravity installed — run with: make test-live"]
 #[serial_test::serial(antigravity)]
@@ -5068,7 +5069,8 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
     };
     let prompt = "Start the shell command `sleep 10 && echo BG_DONE > bg_done.txt` as a \
                   background command, so you do not wait for it. As soon as it has started, \
-                  reply with only the word ack.";
+                  reply with only the word ack. When the command finishes, reply with only \
+                  the word done.";
     let events = antigravity_live_turn(
         &adapter,
         &agent,
@@ -5102,7 +5104,19 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
          harness-behavior §6 description of the wait is stale; events: {events:?}"
     );
 
-    let live_reply: String = events
+    let turn_end = events
+        .iter()
+        .position(|event| matches!(event, AdapterEvent::TurnEnd { .. }))
+        .expect("a TurnEnd");
+    assert!(
+        !events[turn_end..]
+            .iter()
+            .any(|event| matches!(event, AdapterEvent::ContentChunk { .. })),
+        "content arrived after TurnEnd, which the dispatcher drops; events: {events:?}"
+    );
+    // The adapter emits each reply record's text as one chunk, so a chunk's
+    // words are a reply's words.
+    let live_items: Vec<&str> = events[..turn_end]
         .iter()
         .filter_map(|event| match event {
             AdapterEvent::ContentChunk {
@@ -5113,6 +5127,12 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
             _ => None,
         })
         .collect();
+    let live_words: Vec<String> = live_items.iter().flat_map(|text| words(text)).collect();
+    assert!(
+        ack_then_done(&live_words),
+        "the live reply must say ack, then done after the wake-up; got {live_items:?}"
+    );
+    let live_reply = live_items.concat();
     let conversation_id = antigravity_capture(&events).expect("captured conversation id");
     let hydrated =
         load_antigravity_transcript(&home_dir(), cwd.path(), Some(conversation_id), agent.id)
@@ -5136,7 +5156,7 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
         "reopening must show one message and one reply turn; turns: {:?}",
         hydrated.turns
     );
-    let reopened_reply: String = agent_turns[0]
+    let reopened_items: Vec<&str> = agent_turns[0]
         .iter()
         .filter_map(|item| match item {
             TurnItem::Text {
@@ -5146,11 +5166,36 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
             _ => None,
         })
         .collect();
+    let reopened_words: Vec<String> = reopened_items.iter().flat_map(|text| words(text)).collect();
+    assert!(
+        ack_then_done(&reopened_words),
+        "the reopened turn must say ack, then done; got {reopened_items:?}"
+    );
+    let reopened_reply = reopened_items.concat();
     assert_eq!(
         reopened_reply.split_whitespace().collect::<Vec<_>>(),
         live_reply.split_whitespace().collect::<Vec<_>>(),
         "reopening must show the replies the live view showed"
     );
+}
+
+/// Lowercased words with punctuation trimmed, so `Ack.` reads as `ack`.
+fn words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// The word `ack` appears, and `done` appears after it.
+fn ack_then_done(words: &[String]) -> bool {
+    words
+        .iter()
+        .position(|word| word == "ack")
+        .is_some_and(|ack| words[ack..].iter().any(|word| word == "done"))
 }
 
 // ---------------------------------------------------------------------------

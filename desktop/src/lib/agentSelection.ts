@@ -120,9 +120,7 @@ export function claudeModelFamilyLabel(modelId: string): string {
 /// can't drift. Segmented (a toggle) for the short curated lists; a dropdown
 /// only for a harness whose list is long with labels long enough to truncate as
 /// pills. Effort is always segmented (every effort set is short
-/// single words), so there is no `EFFORT_PRESENTATION`. The sidebar
-/// additionally falls back to a dropdown when it must show an off-catalog
-/// persisted value whose label length is unbounded (see `Sidebar.svelte`).
+/// single words), so there is no `EFFORT_PRESENTATION`.
 /// Uniform today (every harness is `segmented`); retained per harness as an
 /// extension point — see the note above `SUPPORTS_MODEL_SELECTION` in
 /// `harnessDisplay.ts` for why these maps are not collapsed.

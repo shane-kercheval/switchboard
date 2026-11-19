@@ -15,6 +15,7 @@ import {
   effortIsRequired,
   effortOptionsFor,
   effortSupportFor,
+  modelLabel,
   resolveModelChange,
   selectionForNewAgent,
   selectionIsValid,
@@ -73,11 +74,21 @@ describe("agent selection catalogs", () => {
       default_effort: "medium",
     });
     expect(DEFAULT_AGENT_SELECTIONS.antigravity).toEqual({
-      model_choices: ["gemini-3.8-flash", "gemini-4-argon"],
+      model_choices: ["gemini-4-neon", "gemini-4-hydrogen"],
       effort_choices: ["medium", "high"],
-      default_model: "gemini-3.8-flash",
+      default_model: "gemini-4-neon",
       default_effort: "medium",
     });
+  });
+
+  it("offers XHigh for the built-in Antigravity models", () => {
+    const { model_choices } = DEFAULT_AGENT_SELECTIONS.antigravity;
+    for (const model of model_choices) {
+      expect(
+        effortOptionsFor("antigravity", model).map(({ value }) => value),
+        model,
+      ).toEqual(["low", "medium", "high", "xhigh"]);
+    }
   });
 
   it("offers only reasoning-bearing Codex effort levels", () => {
@@ -118,12 +129,38 @@ describe("Antigravity effort support", () => {
     }
   });
 
-  it("offers every effort level the model table lists", () => {
-    const models: readonly { value: string; efforts: readonly string[] | null }[] =
-      antigravityModels.models;
+  it("offers every effort level the model table lists, for offered and left-out models", () => {
+    const models: readonly { value: string; efforts: readonly string[] | null }[] = [
+      ...antigravityModels.models,
+      ...antigravityModels.left_out,
+    ];
     for (const { value, efforts } of models) {
-      expect(values(value), value).toHaveLength(efforts?.length ?? 0);
+      expect(values(value), value).toEqual(efforts ?? []);
     }
+  });
+
+  it("offers XHigh only to models that take it", () => {
+    expect(EFFORT_OPTIONS.antigravity.map(({ value }) => value)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    expect(values("three-level-model")).not.toContain("xhigh");
+  });
+
+  it("keeps a left-out model's levels, so an agent on it cannot pick one it lacks", () => {
+    const onLeftOut = selection({
+      model: "left-out-model",
+      effort: "medium",
+      model_choices: ["left-out-model"],
+      effort_choices: ["medium", "xhigh"],
+    });
+    expect(MODEL_OPTIONS.antigravity.map(({ value }) => value)).not.toContain("left-out-model");
+    expect(effortSupportFor("antigravity", "left-out-model").kind).toBe("known");
+    expect(effortIsRequired("antigravity", "left-out-model")).toBe(true);
+    expect([...activatableEffortValues(onLeftOut, "antigravity")]).toEqual(["medium"]);
+    expect(selectionIsValid({ ...onLeftOut, effort: "xhigh" }, "antigravity")).toBe(false);
   });
 
   it("requires effort only for known effort-bearing Antigravity models", () => {
@@ -311,6 +348,22 @@ describe("default agent naming", () => {
       );
     });
     expect(new Set(names).size).toBe(names.length);
+  });
+});
+
+describe("modelLabel", () => {
+  it("names an offered model by its picker label", () => {
+    expect(modelLabel("antigravity", "three-level-model")).toBe("Three Level Model");
+    expect(modelLabel("codex", "gpt-6.2-sol")).toBe("GPT-6.2 Sol");
+  });
+
+  it("names a left-out Antigravity model by its table label", () => {
+    expect(modelLabel("antigravity", "left-out-model")).toBe("Left Out Model");
+  });
+
+  it("returns a value in neither list verbatim", () => {
+    expect(modelLabel("antigravity", "retired-model")).toBe("retired-model");
+    expect(modelLabel("codex", "left-out-model")).toBe("left-out-model");
   });
 });
 

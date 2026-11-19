@@ -309,7 +309,7 @@ describe("SettingsView", () => {
     expect(labels).toEqual([
       "Claude Default model: Opus · Default effort: Medium",
       "Codex Default model: GPT-6.2 Sol · Default effort: Medium",
-      "Antigravity Default model: Gemini 3.8 Flash · Default effort: Medium",
+      "Antigravity Default model: Gemini 4 Neon · Default effort: Medium",
     ]);
   });
 
@@ -350,19 +350,47 @@ describe("SettingsView", () => {
     expect(card?.open).toBe(true);
   });
 
-  it("shows the Antigravity quick choices and defaults", async () => {
+  it("shows the Antigravity quick choices and defaults of a fresh install", async () => {
     render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
     await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
 
+    const modelChoices = screen.getByTestId("settings-selection-antigravity-model-choices");
     expect(
-      screen.getByTestId("settings-selection-antigravity-model-choice-gemini-4-argon"),
-    ).toHaveAttribute("aria-pressed", "true");
-    expect(
-      screen.getByTestId("settings-selection-antigravity-model-choice-gemini-3.8-flash"),
-    ).toHaveAttribute("aria-pressed", "true");
+      within(modelChoices)
+        .getAllByRole("button")
+        .filter((button) => button.getAttribute("aria-pressed") === "true")
+        .map((button) => button.textContent?.trim()),
+    ).toEqual(["Gemini 4 Neon", "Gemini 4 Hydrogen"]);
+    expect(screen.getByTestId("settings-selection-antigravity-model-current")).toHaveValue(
+      "gemini-4-neon",
+    );
+    const xhigh = screen.getByTestId("settings-selection-antigravity-effort-choice-xhigh");
+    expect(xhigh).toHaveTextContent("XHigh");
+    expect(xhigh).toHaveAttribute("aria-pressed", "false");
     expect(screen.getByTestId("settings-selection-antigravity-effort-current")).toHaveValue(
       "medium",
     );
+  });
+
+  it("shows a saved default on a left-out model by name, without levels it lacks", async () => {
+    preferences.agent_defaults.antigravity = {
+      model_choices: ["gemini-4-neon", "left-out-model"],
+      effort_choices: ["medium", "xhigh"],
+      default_model: "left-out-model",
+      default_effort: "medium",
+    };
+    render(SettingsView, { props: { onClose: vi.fn(), section: "agents" } });
+
+    expect(screen.getByTestId("agent-defaults-antigravity-summary")).toHaveTextContent(
+      "Default model: Left Out Model",
+    );
+    await fireEvent.click(screen.getByTestId("agent-defaults-antigravity-summary"));
+    expect(
+      screen.getByTestId("settings-selection-antigravity-model-choice-left-out-model"),
+    ).toHaveTextContent("Left Out Model");
+    const effortDefault = screen.getByTestId("settings-selection-antigravity-effort-current");
+    expect(within(effortDefault).getByRole("option", { name: "XHigh" })).toBeDisabled();
+    expect(within(effortDefault).getByRole("option", { name: "Medium" })).toBeEnabled();
   });
 
   it("refuses an invalid Antigravity default before it can leak through another save", async () => {

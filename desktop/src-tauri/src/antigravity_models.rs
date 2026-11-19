@@ -3,15 +3,24 @@
 //! The table is `desktop/src/lib/antigravityModels.json`. The frontend reads it
 //! for the model and effort pickers, and these tests read the same file, so
 //! there is one list and nothing here can drift from what the window offers.
-//! Google adds and retires Antigravity models without a CLI release, so the
-//! live test compares the file with `agy`'s own list: a model Google retires
-//! fails `make test-live-antigravity` instead of a user's new agent.
+//! The file holds the models the pickers offer and the models left out on
+//! purpose. Google adds and retires Antigravity models without a CLI release,
+//! so the live test compares the two lists together with `agy`'s own list: a
+//! model Google adds or retires fails `make test-live-antigravity` instead of
+//! a user's new agent.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use futures::StreamExt;
 use serde::Deserialize;
-use switchboard_core::HarnessKind;
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
+use switchboard_harness::{
+    AdapterEvent, AntigravityAdapter, DispatchOptions, HarnessAdapter, Turn, TurnOutcome,
+    load_antigravity_transcript,
+};
+use uuid::Uuid;
 
 use crate::preferences::Preferences;
 
@@ -27,22 +36,50 @@ type Catalog = BTreeMap<String, Option<BTreeSet<String>>>;
 
 #[derive(Deserialize)]
 struct Table {
+    /// The models the pickers offer.
     models: Vec<TableModel>,
+    /// Models `agy` lists that Switchboard leaves out on purpose.
+    left_out: Vec<LeftOutModel>,
 }
 
 #[derive(Deserialize)]
 struct TableModel {
     value: String,
+    label: String,
     efforts: Option<Vec<String>>,
 }
 
-fn table() -> Catalog {
-    let table: Table = serde_json::from_str(TABLE).expect("antigravityModels.json parses");
-    table
-        .models
+#[derive(Deserialize)]
+struct LeftOutModel {
+    #[serde(flatten)]
+    model: TableModel,
+    reason: String,
+}
+
+fn parsed_table() -> Table {
+    serde_json::from_str(TABLE).expect("antigravityModels.json parses")
+}
+
+fn as_catalog<'a>(models: impl IntoIterator<Item = &'a TableModel>) -> Catalog {
+    models
         .into_iter()
-        .map(|model| (model.value, model.efforts.map(|e| e.into_iter().collect())))
+        .map(|model| {
+            let efforts = model.efforts.as_ref().map(|e| e.iter().cloned().collect());
+            (model.value.clone(), efforts)
+        })
         .collect()
+}
+
+/// The offered and the left-out models together: every model the table
+/// accounts for, which is what must equal `agy`'s list.
+fn table() -> Catalog {
+    let table = parsed_table();
+    as_catalog(
+        table
+            .models
+            .iter()
+            .chain(table.left_out.iter().map(|left_out| &left_out.model)),
+    )
 }
 
 #[derive(Deserialize)]
@@ -180,13 +217,14 @@ fn every_difference_names_the_model_and_what_changed() {
 }
 
 /// The pickers key their buttons by model id, and [`table`] folds the file into
-/// a map, so a repeated id would pass the live comparison while breaking the
-/// window.
+/// a map, so a repeated id, including one in both lists, would pass the live
+/// comparison while breaking the window.
 #[test]
 fn each_model_id_appears_once_in_the_table() {
-    let table: Table = serde_json::from_str(TABLE).expect("antigravityModels.json parses");
+    let table = parsed_table();
     let mut seen = BTreeSet::new();
-    for model in &table.models {
+    let left_out = table.left_out.iter().map(|left_out| &left_out.model);
+    for model in table.models.iter().chain(left_out) {
         assert!(
             seen.insert(model.value.as_str()),
             "{} appears more than once in antigravityModels.json",
@@ -195,22 +233,35 @@ fn each_model_id_appears_once_in_the_table() {
     }
 }
 
+/// Leaving a model out is a product decision, and the file is where a reader
+/// of the table finds out why.
 #[test]
-fn the_built_in_antigravity_defaults_name_only_models_in_the_table() {
-    let table = table();
+fn every_left_out_model_says_why() {
+    for left_out in parsed_table().left_out {
+        assert!(
+            !left_out.reason.trim().is_empty(),
+            "{} is left out of antigravityModels.json with no reason",
+            left_out.model.value
+        );
+    }
+}
+
+#[test]
+fn the_built_in_antigravity_defaults_name_only_offered_models() {
+    let offered = as_catalog(&parsed_table().models);
     let preferences = Preferences::default();
     let defaults = &preferences.agent_defaults[&HarnessKind::Antigravity];
 
     for model in &defaults.model_choices {
         assert!(
-            table.contains_key(model),
-            "built-in quick choice {model} is not in antigravityModels.json"
+            offered.contains_key(model),
+            "built-in quick choice {model} is not offered in antigravityModels.json"
         );
     }
     let default_model = defaults.default_model.as_deref().unwrap();
     let default_effort = defaults.default_effort.as_deref().unwrap();
     assert!(
-        table[default_model]
+        offered[default_model]
             .as_ref()
             .is_some_and(|levels| levels.contains(default_effort)),
         "the built-in default {default_model} does not take {default_effort}"
@@ -251,10 +302,135 @@ fn live_antigravity_model_table_matches_the_cli_model_list() {
          deleting a model reported missing, confirm it is gone: dispatch it bare with \
          `agy -p ack --model <id>` and no `--effort` (it then reports `not recognized as a \
          known model`; with `--effort` agy misreports an unknown model as `--effort is not \
-         supported`), or check from a second account. Then update the file, and any \
-         default that names a model agy dropped (DEFAULT_AGENT_SELECTIONS in \
-         agentSelection.ts, default_agent_defaults in preferences.rs), and record the \
-         change in harness-behavior.md §3.3/§3.4:\n{}",
+         supported`), or check from a second account. A model agy newly lists goes in \
+         `models` (offered) or `left_out` (with a reason); which is a product decision. \
+         Then update the file, and any default that names a model agy dropped \
+         (DEFAULT_AGENT_SELECTIONS in agentSelection.ts, default_agent_defaults in \
+         preferences.rs), and record the change in harness-behavior.md §3.3/§3.4:\n{}",
         differences.join("\n")
     );
+}
+
+/// What one dispatch of an offered model reported, live and on reopen.
+struct DispatchReport {
+    outcome: Option<TurnOutcome>,
+    live: Option<(Option<String>, Option<String>)>,
+    reopened: Option<(Option<String>, Option<String>)>,
+}
+
+async fn dispatch_ack(
+    adapter: &AntigravityAdapter,
+    model: &str,
+    effort: Option<&str>,
+) -> DispatchReport {
+    let cwd = tempfile::TempDir::new().expect("tempdir");
+    let agent = AgentRecord {
+        model: Some(model.to_owned()),
+        effort: effort.map(str::to_owned),
+        model_choices: Vec::new(),
+        effort_choices: Vec::new(),
+        forked_from_session: None,
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "model-table-agy".to_owned(),
+        harness: HarnessKind::Antigravity,
+        session_locator: None,
+        created_at: chrono::Utc::now(),
+    };
+    let stream = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with only the word ack.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("agy must be on PATH");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let mut report = DispatchReport {
+        outcome: None,
+        live: None,
+        reopened: None,
+    };
+    let mut conversation = None;
+    for event in events {
+        match event {
+            AdapterEvent::TurnEnd {
+                outcome,
+                model,
+                effort,
+                ..
+            } => {
+                report.outcome = Some(outcome);
+                report.live = Some((model, effort));
+            }
+            AdapterEvent::SessionLocatorCaptured {
+                locator: SessionLocator::Uuid(uuid),
+            } => conversation = Some(uuid),
+            _ => {}
+        }
+    }
+    if let Some(conversation) = conversation {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME set"));
+        let transcript =
+            load_antigravity_transcript(&home, cwd.path(), Some(conversation), agent.id)
+                .expect("the conversation reopens");
+        report.reopened = transcript
+            .turns
+            .into_iter()
+            .rev()
+            .find_map(|turn| match turn {
+                Turn::Agent { model, effort, .. } => Some((model, effort)),
+                _ => None,
+            });
+    }
+    report
+}
+
+/// Dispatches every offered model at every level the table lists for it, and
+/// checks that the turn footer and the reopened history name the model by its
+/// picker label and the level the agent was set to. `agy` announces the pair as
+/// one display name, `Gemini 4 Neon (XHigh)`, and the adapter splits the level
+/// off only when it names a real one, so a level the split does not know, or a
+/// label that drifts from agy's name, shows here. Eight `ack` turns at
+/// agy 1.5.12; every mismatch is collected so one run reports them all.
+#[tokio::test]
+#[ignore = "requires antigravity installed — run with: make test-live"]
+#[serial_test::serial(antigravity)]
+async fn live_antigravity_offered_models_dispatch_at_every_level() {
+    let adapter = AntigravityAdapter::new();
+    let mut failures = Vec::new();
+    for model in parsed_table().models {
+        let levels: Vec<Option<String>> = match &model.efforts {
+            Some(levels) => levels.iter().cloned().map(Some).collect(),
+            None => vec![None],
+        };
+        for level in levels {
+            let pair = format!(
+                "{} {}",
+                model.value,
+                level.as_deref().unwrap_or("(no effort)")
+            );
+            let report = dispatch_ack(&adapter, &model.value, level.as_deref()).await;
+            let expected = Some((Some(model.label.clone()), level.clone()));
+            if !matches!(report.outcome, Some(TurnOutcome::Completed)) {
+                failures.push(format!("{pair}: the turn ended {:?}", report.outcome));
+            }
+            if report.live != expected {
+                failures.push(format!(
+                    "{pair}: live (model, effort) was {:?}, expected {expected:?}",
+                    report.live
+                ));
+            }
+            if report.reopened != expected {
+                failures.push(format!(
+                    "{pair}: reopened (model, effort) was {:?}, expected {expected:?}",
+                    report.reopened
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

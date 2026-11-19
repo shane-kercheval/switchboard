@@ -599,12 +599,38 @@ describe("CreateAgentForm", () => {
       name: "antigravity",
       harness: "antigravity",
       selection: {
-        model: "gemini-3.8-flash",
+        model: "gemini-4-neon",
         effort: "medium",
-        model_choices: ["gemini-3.8-flash", "gemini-4-argon"],
+        model_choices: ["gemini-4-neon", "gemini-4-hydrogen"],
         effort_choices: ["medium", "high"],
       },
     } satisfies AgentFormSubmit);
+  });
+
+  it("create + Antigravity: a saved quick choice on a left-out model keeps its name and levels", async () => {
+    preferences.agent_defaults.antigravity = {
+      model_choices: ["gemini-4-neon", "left-out-model"],
+      effort_choices: ["medium", "xhigh"],
+      default_model: "left-out-model",
+      default_effort: "medium",
+    };
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("harness-antigravity"));
+
+    expect(screen.getByTestId("create-selection-model-choice-left-out-model")).toHaveTextContent(
+      "Left Out Model",
+    );
+    expect(pickerValue("model-select")).toBe("left-out-model");
+    const effortCurrent = screen.getByTestId("create-selection-effort-current");
+    expect(within(effortCurrent).getByRole("option", { name: "XHigh" })).toBeDisabled();
+    expect(within(effortCurrent).getByRole("option", { name: "Medium" })).toBeEnabled();
+
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        selection: expect.objectContaining({ model: "left-out-model", effort: "medium" }),
+      }),
+    );
   });
 
   it("create + Antigravity: a model with no effort axis keeps future choices configurable", async () => {

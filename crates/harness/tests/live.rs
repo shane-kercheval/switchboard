@@ -4964,8 +4964,8 @@ async fn live_antigravity_model_change_announced_on_resume() {
     // Antigravity's per-turn model history is a *carry-forward* of the
     // `USER_SETTINGS_CHANGE` sentence, which `agy` writes on the first turn and
     // whenever the model changes. Each turn passes its model with `--model`,
-    // the way Switchboard does; probed @ 1.4.3, a resume on a different model
-    // writes "from Gemini 3.8 Flash (Low) to Claude Sonnet 5.5 (Low)" and leaves
+    // the way Switchboard does; probed @ 1.5.12, a resume on a different model
+    // writes "from Gemini 4 Hydrogen (Low) to Gemini 4 Neon (Low)" and leaves
     // `~/.gemini/antigravity-cli/settings.json` untouched. The test therefore
     // never writes the developer's global `agy` settings.
     let cwd = tempfile::TempDir::new().unwrap();
@@ -4973,7 +4973,7 @@ async fn live_antigravity_model_change_announced_on_resume() {
     let agent_id = Uuid::now_v7();
     // Turn 1 on model X.
     let mut agent = AgentRecord {
-        model: Some("gemini-3.8-flash".to_owned()),
+        model: Some("gemini-4-hydrogen".to_owned()),
         effort: Some("low".to_owned()),
         model_choices: Vec::new(),
         effort_choices: Vec::new(),
@@ -4999,14 +4999,14 @@ async fn live_antigravity_model_change_announced_on_resume() {
     let (m1, _) = turn_end_model_effort(&events1).expect("turn 1 TurnEnd");
     assert!(
         m1.as_deref()
-            .is_some_and(|m| m.contains("Gemini 3.8 Flash")),
-        "turn 1 per-turn model = Gemini 3.8 Flash; got {m1:?}"
+            .is_some_and(|m| m.contains("Gemini 4 Hydrogen")),
+        "turn 1 per-turn model = Gemini 4 Hydrogen; got {m1:?}"
     );
     let conversation_id = antigravity_capture(&events1).expect("captured conversation id");
 
     // Turn 2: resume on model Y.
     agent.session_locator = Some(SessionLocator::Uuid(conversation_id));
-    agent.model = Some("claude-sonnet-5-5".to_owned());
+    agent.model = Some("gemini-4-neon".to_owned());
     agent.effort = Some("low".to_owned());
     let events2 = antigravity_live_turn(
         &adapter,
@@ -5023,9 +5023,8 @@ async fn live_antigravity_model_change_announced_on_resume() {
     .await;
     let (m2, _) = turn_end_model_effort(&events2).expect("turn 2 TurnEnd");
     assert!(
-        m2.as_deref()
-            .is_some_and(|m| m.contains("Claude Sonnet 5.5")),
-        "turn 2 per-turn model = Claude Sonnet 5.5; got {m2:?}"
+        m2.as_deref().is_some_and(|m| m.contains("Gemini 4 Neon")),
+        "turn 2 per-turn model = Gemini 4 Neon; got {m2:?}"
     );
 
     // Hydration reconstructs the carry-forward from the transcript.
@@ -5037,15 +5036,15 @@ async fn live_antigravity_model_change_announced_on_resume() {
         models
             .first()
             .and_then(Option::as_deref)
-            .is_some_and(|m| m.contains("Gemini 3.8 Flash")),
-        "hydrated turn 1 = Gemini 3.8 Flash; got {models:?}"
+            .is_some_and(|m| m.contains("Gemini 4 Hydrogen")),
+        "hydrated turn 1 = Gemini 4 Hydrogen; got {models:?}"
     );
     assert!(
         models
             .last()
             .and_then(Option::as_deref)
-            .is_some_and(|m| m.contains("Claude Sonnet 5.5")),
-        "hydrated last turn = Claude Sonnet 5.5; got {models:?}"
+            .is_some_and(|m| m.contains("Gemini 4 Neon")),
+        "hydrated last turn = Gemini 4 Neon; got {models:?}"
     );
 }
 

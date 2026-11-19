@@ -2632,13 +2632,10 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
 
     #[test]
     fn build_args_sends_a_no_axis_model_without_an_effort() {
-        // The two Claude models have no effort axis at all — `agy` rejects
-        // `--effort` for them outright (probed). A model alone is a valid
-        // invocation. (`gpt-oss-120b` is a different case: it accepts exactly
-        // one level, `medium`, and also dispatches bare.)
+        // `agy` lists the orchestrator models with no effort level.
         let log = PathBuf::from("/tmp/x.log");
         let agent = AgentRecord {
-            model: Some("claude-sonnet-4-6".to_owned()),
+            model: Some("gemini-pro-orchestrator-neon".to_owned()),
             effort: None,
             ..bare_agent()
         };

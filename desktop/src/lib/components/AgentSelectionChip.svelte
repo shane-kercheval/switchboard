@@ -3,9 +3,9 @@
   import type { AgentSelection, HarnessKind } from "$lib/types";
   import {
     EFFORT_OPTIONS,
-    MODEL_OPTIONS,
     activatableEffortValues,
     effortSupportFor,
+    modelLabel,
     resolveModelChange,
     type SelectionOption,
   } from "$lib/agentSelection";
@@ -27,7 +27,6 @@
 
   const values = $derived(axis === "model" ? selection.model_choices : selection.effort_choices);
   const current = $derived(axis === "model" ? selection.model : selection.effort);
-  const catalog = $derived(axis === "model" ? MODEL_OPTIONS[harness] : EFFORT_OPTIONS[harness]);
   const effortSupport = $derived(effortSupportFor(harness, selection.model));
   const activatableEfforts = $derived(activatableEffortValues(selection, harness));
   const axisName = $derived(axis === "model" ? "model" : "reasoning effort");
@@ -43,7 +42,11 @@
 
   function label(value: string | null): string {
     if (value === null) return "Harness default";
-    return catalog.find((option: SelectionOption) => option.value === value)?.label ?? value;
+    if (axis === "model") return modelLabel(harness, value);
+    return (
+      EFFORT_OPTIONS[harness].find((option: SelectionOption) => option.value === value)?.label ??
+      value
+    );
   }
 
   function resultFor(

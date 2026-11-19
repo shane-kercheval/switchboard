@@ -5048,6 +5048,111 @@ async fn live_antigravity_model_change_announced_on_resume() {
     );
 }
 
+/// `agy -p` waits for a background command before it exits, then writes a
+/// wake-up `SYSTEM_MESSAGE` and usually a second reply into the same
+/// conversation. This fails if reopening shows that turn differently from the
+/// live view (a user message for the wake-up, a split turn, a lost or doubled
+/// reply), or if `agy` stops waiting, which README and harness-behavior §6
+/// describe. Pinned to Gemini 4 Hydrogen, which starts the command in the
+/// background when asked.
+#[tokio::test]
+#[ignore = "requires antigravity installed — run with: make test-live"]
+#[serial_test::serial(antigravity)]
+async fn live_antigravity_background_task_reopens_as_it_streamed() {
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::new();
+    let agent = AgentRecord {
+        model: Some("gemini-4-hydrogen".to_owned()),
+        effort: Some("medium".to_owned()),
+        ..live_antigravity_agent()
+    };
+    let prompt = "Start the shell command `sleep 10 && echo BG_DONE > bg_done.txt` as a \
+                  background command, so you do not wait for it. As soon as it has started, \
+                  reply with only the word ack.";
+    let events = antigravity_live_turn(
+        &adapter,
+        &agent,
+        cwd.path(),
+        prompt,
+        Uuid::now_v7(),
+        // The command writes into the workspace and the test hydrates the
+        // transcript, so a retried turn would corrupt what it measures.
+        RetryPolicy::Never,
+    )
+    .await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ToolCompleted { output, .. } if output.contains("running as a background task")
+        )),
+        "the model started no background task, so this run tested nothing; events: {events:?}"
+    );
+    let outcome = events.iter().find_map(|event| match event {
+        AdapterEvent::TurnEnd { outcome, .. } => Some(outcome),
+        _ => None,
+    });
+    assert!(
+        matches!(outcome, Some(TurnOutcome::Completed)),
+        "expected the turn to complete; events: {events:?}"
+    );
+    assert!(
+        cwd.path().join("bg_done.txt").exists(),
+        "agy -p ended the turn before its background command finished, so the README and \
+         harness-behavior §6 description of the wait is stale; events: {events:?}"
+    );
+
+    let live_reply: String = events
+        .iter()
+        .filter_map(|event| match event {
+            AdapterEvent::ContentChunk {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let conversation_id = antigravity_capture(&events).expect("captured conversation id");
+    let hydrated =
+        load_antigravity_transcript(&home_dir(), cwd.path(), Some(conversation_id), agent.id)
+            .expect("hydrate");
+    let user_turns = hydrated
+        .turns
+        .iter()
+        .filter(|turn| matches!(turn, Turn::User { .. }))
+        .count();
+    let agent_turns: Vec<&[TurnItem]> = hydrated
+        .turns
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::Agent { items, .. } => Some(items.as_slice()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        (user_turns, agent_turns.len()),
+        (1, 1),
+        "reopening must show one message and one reply turn; turns: {:?}",
+        hydrated.turns
+    );
+    let reopened_reply: String = agent_turns[0]
+        .iter()
+        .filter_map(|item| match item {
+            TurnItem::Text {
+                kind: ContentKind::Text,
+                text,
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reopened_reply.split_whitespace().collect::<Vec<_>>(),
+        live_reply.split_whitespace().collect::<Vec<_>>(),
+        "reopening must show the replies the live view showed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tool-facet drift guards (harness-behavior §3.6). These are the tests that
 // notice when a CLI vendor changes its tool wire shapes: the fixture-driven

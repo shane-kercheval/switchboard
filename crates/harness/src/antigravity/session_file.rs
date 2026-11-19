@@ -989,6 +989,61 @@ mod tests {
         );
     }
 
+    /// Captured @ agy 1.5.12 (2026-11-19, Gemini 4 Hydrogen, the adapter's
+    /// dispatch flags, compact transcript; the planner's `thinking` is left
+    /// out): a background command. `agy -p` waits for it, then writes a
+    /// `SYSTEM_MESSAGE` and a second reply. The live view shows one turn with
+    /// both replies, so reopening must too, with no user message for the
+    /// wake-up, and the call's result left `RUNNING` must not read as failed.
+    #[test]
+    fn a_background_task_wake_up_reopens_in_the_same_turn() {
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-19T21:31:21Z","content":"<USER_REQUEST>\nStart the shell command `sleep 10 && echo BG_DONE > bg_done.txt` as a background command, so you do not wait for it. As soon as it has started, reply with only the word ack.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-19T15:31:21-06:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Hydrogen (Medium). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.\n</USER_SETTINGS_CHANGE>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T21:31:21Z","model":"gemini-4-hydrogen-medium","input_tokens":10592,"cache_read_tokens":0,"output_tokens":237,"tool_calls":[{"name":"run_command","args":{"CommandLine":"\"sleep 10 && echo BG_DONE > bg_done.txt\"","IsDaemon":"false","WaitMsBeforeAsync":"500","toolSummary":"\"Background sleep and write file\""}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","created_at":"2026-11-19T21:31:23Z","content":"Created At: 2026-11-19T15:31:23-06:00\nTool is running as a background task with task id: 963bbd33-c6a9-4438-9501-e06b546498f2/task-2\nTask Description: sleep 10 && echo BG_DONE > bg_done.txt\nTask logs are available at: file:///Users/me/.gemini/antigravity-cli/brain/963bbd33-c6a9-4438-9501-e06b546498f2/.system_generated/tasks/task-2.log\nYOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: A) either proceed to other relevant work (if any) or, B) simply update the user with a short message (that you have launched the command and will wait for it to finish) and end the turn.\n DO NOTHING ELSE."}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T21:31:25Z","model":"gemini-4-hydrogen-medium","input_tokens":2490,"cache_read_tokens":8538,"output_tokens":83,"content":"ack"}"#,
+            "\n",
+            r#"{"step_index":4,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-19T21:31:35Z","content":"The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-19T21:31:35Z sender=963bbd33-c6a9-4438-9501-e06b546498f2/task-2 priority=MESSAGE_PRIORITY_HIGH content=Task id \"963bbd33-c6a9-4438-9501-e06b546498f2/task-2\" finished with result:\nCommand exited with code 0.\n\nNo output from the command.\nLog: file:///Users/me/.gemini/antigravity-cli/brain/963bbd33-c6a9-4438-9501-e06b546498f2/.system_generated/tasks/task-2.log\n</SYSTEM_MESSAGE>"}"#,
+            "\n",
+            r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T21:31:35Z","model":"gemini-4-hydrogen-medium","input_tokens":2388,"cache_read_tokens":8979,"output_tokens":208,"content":"The background command (`963bbd33-c6a9-4438-9501-e06b546498f2/task-2`) has finished with exit code 0."}"#,
+            "\n",
+        );
+        let transcript = parse_antigravity_transcript_content(content, agent_id());
+        assert!(transcript.warnings.is_empty(), "{:?}", transcript.warnings);
+        assert_eq!(transcript.turns.len(), 2, "{:?}", transcript.turns);
+        assert!(user_turn_text(&transcript.turns[0]).starts_with("Start the shell command"));
+        let items = agent_items(&transcript.turns[1]);
+        let replies: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Text {
+                    kind: ContentKind::Text,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            vec![
+                "ack",
+                "The background command (`963bbd33-c6a9-4438-9501-e06b546498f2/task-2`) has finished with exit code 0.",
+            ]
+        );
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                TurnItem::Tool { name, is_error: Some(false), output: Some(output), .. }
+                    if name == "run_command" && output.contains("running as a background task")
+            )),
+            "{items:?}"
+        );
+        assert_eq!(agent_status(&transcript.turns[1]), TurnStatus::Complete);
+    }
+
     /// Synthetic: a failure whose status the parser does not list (`REJECTED`
     /// is not among the binary's step statuses @ 1.4.9 or 1.4.10). Reopening
     /// must show it as failed on its `error` alone, as the live view does.

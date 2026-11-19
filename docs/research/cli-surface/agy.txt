@@ -1,4 +1,4 @@
-version: 1.4.10
+version: 1.5.12
 
 ===== agy --help
 Usage of agy:
@@ -24,11 +24,13 @@ Usage of agy:
   --project                       Project ID or project name for the current CLI session
   --prompt                        Alias for --print
   --prompt-interactive            Run an initial prompt interactively and continue the session
+  --remote-agent                  Run this session's conversations using remote agents; --project then names a remote project by ID or name, otherwise they open in this machine's default remote project
   --remote-control                Create a remote connection for the CLI session on start up
   --sandbox                       Run in a sandbox with terminal restrictions enabled
   --settings                      Settings for this session only, never saved: a JSON object of settings.json keys, inline or as a file path
 
 Available subcommands:
+  acp             Start the Agent Client Protocol (ACP) stdio server
   agent           List available agents
   agents          List available agents
   changelog       Show changelog and release notes
@@ -41,6 +43,40 @@ Available subcommands:
   plugins         Alias for plugin
   remote-control  Manage the remote-control background daemon (start, status, stop)
   update          Update CLI
+
+===== agy help acp
+Usage: agy acp [flags]
+
+Start the Agent Client Protocol (ACP) stdio server
+
+Flags:
+  --add-dir                         Add a directory to the workspace (repeatable) (default [])
+  --agent                           Agent for the ACP session
+  --app-data-dir                    Path where application data is stored (default antigravity-cli)
+  --app_data_dir                    Path where application data is stored (default antigravity-cli)
+  --cli_dir_name                    Subdirectory under app_data_dir for CLI settings and logs
+  --cli_log_file                    Override ACP log file path
+  --cloud_code_endpoint             CCPA API URL (default https://daily-cloudcode-pa.googleapis.com)
+  --dangerously-skip-permissions    Auto-approve all tool permission requests
+  --disable-telemetry               If true, disable telemetry
+  --disable_telemetry               If true, disable telemetry
+  --gemini-dir                      Path where Gemini files are stored (default .gemini)
+  --gemini_dir                      Path where Gemini files are stored (default .gemini)
+  -h                                Show help
+  --help                            Show help
+  --ide-mcp-port                    Port for host IDE tools MCP server (requires 'nc' in $PATH) (default 0)
+  --ide_mcp_port                    Port for host IDE tools MCP server (requires 'nc' in $PATH) (default 0)
+  --include-default-customizations  Include default customizations (default true)
+  --is_google3_workspace            Whether running in Google environment
+  --is_google_internal              Deprecated: use is_google3_workspace
+  --log-file                        Override ACP log file path
+  --login                           Log in with Google interactively, then exit (ACP terminal auth)
+  --override_user_agent_name        Override user agent name for HTTP requests
+  --process-per-session             Serve each session from an isolated worker process
+  --sandbox                         Run in a sandbox with terminal restrictions enabled
+  --stdio                           Use stdio JSON-RPC transport (default)
+  --use_stubby_auth                 Use LOAS auth
+  --worker                          Serve a single session for an ACP front process (internal)
 
 ===== agy help agent
 Usage: agy agent [flags]
@@ -188,8 +224,10 @@ Commands:
   uninstall <name>       Uninstall a plugin
   enable <name>          Enable a plugin
   disable <name>         Disable a plugin
-  validate [path] [--strict] [--json]
-                         Check a plugin's manifest and files
+  validate [target] [--strict] [--json]
+                         Check a plugin's manifest and files: a directory,
+                         a .zip, a URL, or the plugins of a marketplace.json
+                         (see validate --help)
   link <mp> <target>     Generate link to a marketplace
   help                   Show this help
 
@@ -203,8 +241,10 @@ Commands:
   uninstall <name>       Uninstall a plugin
   enable <name>          Enable a plugin
   disable <name>         Disable a plugin
-  validate [path] [--strict] [--json]
-                         Check a plugin's manifest and files
+  validate [target] [--strict] [--json]
+                         Check a plugin's manifest and files: a directory,
+                         a .zip, a URL, or the plugins of a marketplace.json
+                         (see validate --help)
   link <mp> <target>     Generate link to a marketplace
   help                   Show this help
 

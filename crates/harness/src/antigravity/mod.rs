@@ -1700,15 +1700,14 @@ fn extract_model_from_record(rec: &TranscriptRecord) -> Option<(String, Option<S
 /// Split an announced display name into its model and, where the parenthetical
 /// names one, its effort level.
 ///
-/// Antigravity announces `Gemini 3.1 Pro (High)` — model and effort in one
-/// string. Only a parenthetical that maps to a real level is split off; every
-/// other one stays part of the name, because for several models it *is* the
-/// name (`Claude Sonnet 4.6 (Thinking)`, `GPT-OSS 120B (Medium)` — those have
-/// no effort axis and `agy` rejects `--effort` for them). An earlier version
-/// stripped every parenthetical unconditionally, which both discarded the
-/// effort and mangled those names.
+/// Antigravity announces `Gemini 4 Neon (XHigh)`: model and effort in one
+/// string. Only a parenthetical that names one of the levels `--effort` accepts
+/// is split off; any other stays part of the name, because for some models it
+/// *is* the name (`Claude Sonnet 4.6 (Thinking)`, `Orchestrator (Neon)`).
 fn split_announced_model(display: &str) -> (String, Option<String>) {
-    const LEVELS: [&str; 3] = ["low", "medium", "high"];
+    // The levels `agy --help` lists for `--effort`; a level missing here makes
+    // its turns show the whole announcement as the model and no effort.
+    const LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
     let Some((name, tail)) = display.rsplit_once(" (") else {
         return (display.to_owned(), None);
     };
@@ -3116,12 +3115,14 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
 
     #[test]
     fn a_non_level_parenthetical_stays_part_of_the_model_name() {
-        // The Claude models have no effort axis (probed: `--effort is not
+        // These models have no effort axis (probed: `--effort is not
         // supported for model …`), so their parenthetical *is* the name. An
         // earlier version stripped every parenthetical, mangling them.
         for announced in [
             "Claude Sonnet 4.6 (Thinking)",
             "Claude Opus 4.6 (Thinking)",
+            "Orchestrator (Neon)",
+            "Orchestrator (Argon)",
             "Gemini 3.1 Pro",
         ] {
             let (name, effort) = split_announced_model(announced);
@@ -3133,10 +3134,9 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
     #[test]
     fn gpt_oss_display_name_splits_because_its_level_is_real() {
         // Not an exception to the rule above: `medium` is genuinely this
-        // model's effort (probed — `--effort medium` dispatches while
+        // model's effort (probed: `--effort medium` dispatches while
         // `low`/`high` are rejected), so the turn ran at it and the footer
-        // should say so. The picker separately declines to offer it, being the
-        // only level and optional; see `split_announced_model`.
+        // should say so.
         assert_eq!(
             split_announced_model("GPT-OSS 120B (Medium)"),
             ("GPT-OSS 120B".to_owned(), Some("medium".to_owned()))
@@ -3149,11 +3149,41 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
             ("Gemini 3.1 Pro (High)", "high"),
             ("Gemini 3.5 Flash (LOW)", "low"),
             ("Gemini 3.7 Flash (medium)", "medium"),
+            ("Gemini 4 Neon (xhigh)", "xhigh"),
+            ("Gemini 4 Neon (MAX)", "max"),
         ] {
             let (name, effort) = split_announced_model(announced);
             assert!(!name.contains('('), "{name}");
             assert_eq!(effort.as_deref(), Some(level));
         }
+    }
+
+    #[test]
+    fn the_levels_above_high_split_too() {
+        // Announced as captured from agy 1.5.12 for `--effort xhigh`; `max` is
+        // accepted by `--effort` though no model listed it at 1.5.12.
+        for (announced, model, level) in [
+            ("Gemini 4 Neon (XHigh)", "Gemini 4 Neon", "xhigh"),
+            ("Gemini 4 Hydrogen (XHigh)", "Gemini 4 Hydrogen", "xhigh"),
+            ("Gemini 4 Neon (Max)", "Gemini 4 Neon", "max"),
+        ] {
+            assert_eq!(
+                split_announced_model(announced),
+                (model.to_owned(), Some(level.to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn an_xhigh_announcement_reaches_the_record_split() {
+        let rec: TranscriptRecord = serde_json::from_str(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Hydrogen (XHigh). No need to comment on this change if the user doesn't ask about it.</USER_SETTINGS_CHANGE>"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_model_from_record(&rec),
+            Some(("Gemini 4 Hydrogen".to_owned(), Some("xhigh".to_owned())))
+        );
     }
 
     #[test]

@@ -115,15 +115,8 @@ export function claudeModelFamilyLabel(modelId: string): string {
   return modelId;
 }
 
-/// How the **model** picker renders per harness — the single source of truth
-/// both the create form and the sidebar change-model dialog read, so the two
-/// can't drift. Segmented (a toggle) for the short curated lists; a dropdown
-/// only for a harness whose list is long with labels long enough to truncate as
-/// pills. Effort is always segmented (every effort set is short
-/// single words), so there is no `EFFORT_PRESENTATION`.
-/// Uniform today (every harness is `segmented`); retained per harness as an
-/// extension point — see the note above `SUPPORTS_MODEL_SELECTION` in
-/// `harnessDisplay.ts` for why these maps are not collapsed.
+/// A per-harness choice between a segmented toggle and a dropdown for the model
+/// picker. No component reads it.
 export const MODEL_PRESENTATION: Record<HarnessKind, "segmented" | "dropdown"> = {
   claude_code: "segmented",
   codex: "segmented",

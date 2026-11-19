@@ -79,7 +79,7 @@ pub(crate) struct StreamResult {
     /// `result.error`, when non-empty.
     pub error: Option<String>,
     /// `result.finished_reason` is `print_timeout`: `--print-timeout` ended the
-    /// turn, and `agy` killed the background commands it was waiting on.
+    /// turn, and `agy` killed any background commands still running.
     pub print_timeout: bool,
 }
 

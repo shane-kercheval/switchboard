@@ -151,9 +151,9 @@ const FINAL_DRAIN_ATTEMPTS: u32 = 6;
 
 /// Value passed to `agy --print-timeout`, a whole-turn cap. `agy`'s own default
 /// (`0`) is no limit, and `-p` waits for background commands, so a command that
-/// never ends would hold the turn forever. At the cap `agy` kills those commands
-/// and reports `finished_reason: "print_timeout"`, which `classify_outcome`
-/// fails.
+/// never ends would hold the turn forever. At the cap `agy` ends the turn, kills
+/// any background commands still running, and reports
+/// `finished_reason: "print_timeout"`, which `classify_outcome` fails.
 const PRINT_TIMEOUT: &str = "24h";
 
 /// The levels `agy --effort` accepts (`agy --help`). Which of them a model takes
@@ -1993,8 +1993,8 @@ fn classify_outcome(
             kind: FailureKind::HarnessError,
             message: result.error.clone().unwrap_or_else(|| {
                 format!(
-                    "Antigravity ended the turn at its {PRINT_TIMEOUT} limit while it waited \
-                     for a background command; the reply may be incomplete"
+                    "Antigravity ended the turn at its {PRINT_TIMEOUT} limit; the reply may \
+                     be incomplete"
                 )
             }),
         };
@@ -3378,8 +3378,7 @@ printf 'Warning: conversation "x" not found.\nError: boom\n' >&2; : > "$1"; exec
             outcome,
             TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
-                message: "Antigravity ended the turn at its 24h limit while it waited for a \
-                          background command; the reply may be incomplete"
+                message: "Antigravity ended the turn at its 24h limit; the reply may be incomplete"
                     .to_owned(),
             }
         );

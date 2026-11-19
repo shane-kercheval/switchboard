@@ -3847,7 +3847,9 @@ async fn live_antigravity_dash_leading_prompt_completes() {
 /// with plausible-looking output — so this is worth a live turn.
 ///
 /// Uses a multi-tool prompt because a single-call turn cannot distinguish
-/// `P + 1 + call_index` from a simple "next step" rule.
+/// `P + 1 + call_index` from a simple "next step" rule. Also checks that each
+/// call's result step holds that call's own output, because the step lists
+/// alone would match if the two calls traded results.
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 #[serial_test::serial(antigravity)]
@@ -3880,6 +3882,12 @@ async fn live_antigravity_tool_result_steps_follow_the_call_index() {
              agy's step numbering changed and tool results will attach to the wrong call. \
              transcript: {content}"
         );
+        if let Some(mismatch) = call_output_mismatch(&content) {
+            panic!(
+                "each tool result must hold its own call's output, or tool results attach \
+                 to the wrong call; {mismatch}. transcript: {content}"
+            );
+        }
         return;
     }
     unreachable!("loop returns or panics on the final attempt")
@@ -3933,6 +3941,7 @@ fn planner_tool_calls(content: &str) -> impl Iterator<Item = serde_json::Value> 
 /// neither can satisfy the other's check.
 const STEP_PROBE_ECHO_TOKEN: &str = "STEP_PROBE_ONE";
 const STEP_PROBE_FILE: &str = "STEP_PROBE.txt";
+const STEP_PROBE_FILE_TEXT: &str = "step probe fixture";
 
 /// Guards `is_benign_merge`'s discipline. **Not `#[ignore]`d**: this classifier
 /// decides whether the live drift alarm is allowed to re-arm, so it must not be
@@ -4051,8 +4060,11 @@ async fn run_multi_tool_step_probe() -> (TurnOutcome, String) {
         .prefix("agy-step-probe")
         .tempdir()
         .expect("tempdir");
-    std::fs::write(tmp.path().join("STEP_PROBE.txt"), "step probe fixture\n")
-        .expect("seed the file the second tool call reads");
+    std::fs::write(
+        tmp.path().join(STEP_PROBE_FILE),
+        format!("{STEP_PROBE_FILE_TEXT}\n"),
+    )
+    .expect("seed the file the second tool call reads");
     let adapter = AntigravityAdapter::new();
     let agent = live_antigravity_agent();
 
@@ -4106,6 +4118,118 @@ fn step_pairs(content: &str) -> (Vec<i64>, Vec<i64>) {
     expected.sort_unstable();
     observed.sort_unstable();
     (expected, observed)
+}
+
+/// The first call whose result, at `planner_step + 1 + call_index`, lacks its
+/// own output or holds the other call's: the echo's result must show the echo
+/// token and not the file's text, the read's the reverse. A call whose
+/// arguments name both sentinels or neither is skipped, but at least one echo
+/// and one read must be checked.
+fn call_output_mismatch(content: &str) -> Option<String> {
+    let records: Vec<serde_json::Value> = transcript_records(content).collect();
+    let output_at = |step: i64| {
+        records
+            .iter()
+            .find(|r| {
+                r["source"] == "MODEL"
+                    && r["type"] != "PLANNER_RESPONSE"
+                    && r["step_index"].as_i64() == Some(step)
+            })
+            .and_then(|r| r["content"].as_str())
+            .unwrap_or_default()
+    };
+    let (mut echo_checked, mut read_checked) = (false, false);
+    for record in records.iter().filter(|r| r["type"] == "PLANNER_RESPONSE") {
+        let step = record["step_index"].as_i64().unwrap_or_default();
+        let calls = record["tool_calls"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for (index, call) in calls.iter().enumerate() {
+            let args = call["args"].to_string();
+            let (own, other) = match (
+                args.contains(STEP_PROBE_ECHO_TOKEN),
+                args.contains(STEP_PROBE_FILE),
+            ) {
+                (true, false) => {
+                    echo_checked = true;
+                    (STEP_PROBE_ECHO_TOKEN, STEP_PROBE_FILE_TEXT)
+                }
+                (false, true) => {
+                    read_checked = true;
+                    (STEP_PROBE_FILE_TEXT, STEP_PROBE_ECHO_TOKEN)
+                }
+                _ => continue,
+            };
+            let result_step = step + 1 + i64::try_from(index).unwrap();
+            let output = output_at(result_step);
+            if !output.contains(own) || output.contains(other) {
+                return Some(format!(
+                    "{} called at step {step} should show {own:?} at step {result_step}, \
+                     which holds {output:?}",
+                    call["name"]
+                ));
+            }
+        }
+    }
+    (!(echo_checked && read_checked)).then(|| {
+        format!("expected an echo call and a read call; echo: {echo_checked}, read: {read_checked}")
+    })
+}
+
+/// Guards `call_output_mismatch`, which the live step test relies on to notice
+/// traded results. Not `#[ignore]`d, for the reason given on
+/// `benign_merge_requires_positive_evidence_of_both_jobs`.
+#[test]
+fn call_output_mismatch_catches_traded_results() {
+    fn transcript(echo_output: &str, read_output: &str) -> String {
+        [
+            json!({
+                "step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": "\"echo STEP_PROBE_ONE\""}},
+                    {"name": "view_file", "args": {"AbsolutePath": "\"/w/STEP_PROBE.txt\""}},
+                ],
+            }),
+            json!({"step_index": 3, "source": "MODEL", "type": "RUN_COMMAND", "content": echo_output}),
+            json!({"step_index": 4, "source": "MODEL", "type": "VIEW_FILE", "content": read_output}),
+        ]
+        .map(|record| record.to_string())
+        .join("\n")
+    }
+
+    assert_eq!(
+        call_output_mismatch(&transcript(
+            "Output:\nSTEP_PROBE_ONE\n",
+            "1: step probe fixture\n"
+        )),
+        None
+    );
+    assert!(
+        call_output_mismatch(&transcript(
+            "1: step probe fixture\n",
+            "Output:\nSTEP_PROBE_ONE\n"
+        ))
+        .is_some(),
+        "traded results must be caught"
+    );
+    assert!(
+        call_output_mismatch(&transcript("Output:\n\n", "1: step probe fixture\n")).is_some(),
+        "a result missing its own output must be caught"
+    );
+    let echo_only = [
+        json!({
+            "step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "\"echo STEP_PROBE_ONE\""}}],
+        }),
+        json!({"step_index": 3, "source": "MODEL", "type": "RUN_COMMAND", "content": "STEP_PROBE_ONE"}),
+    ]
+    .map(|record| record.to_string())
+    .join("\n");
+    assert!(
+        call_output_mismatch(&echo_only).is_some(),
+        "a turn with no read call checked nothing"
+    );
 }
 
 fn transcript_records(content: &str) -> impl Iterator<Item = serde_json::Value> + '_ {
@@ -5050,12 +5174,12 @@ async fn live_antigravity_model_change_announced_on_resume() {
 
 /// `agy -p` waits for a background command before it exits, then writes a
 /// wake-up `SYSTEM_MESSAGE` and lets the model reply again in the same turn.
-/// The prompt asks for `ack` at the start and `done` after the wake-up, so this
-/// fails if the follow-up is lost or arrives after `TurnEnd`, if reopening
-/// shows the turn differently (a user message for the wake-up, a split turn, a
-/// lost or doubled reply), or if `agy` stops waiting, which README and
-/// harness-behavior §6 describe. Pinned to Gemini 4 Hydrogen, which starts the
-/// command in the background when asked.
+/// The prompt asks for `ack` at the start and `done` after the wake-up, each as
+/// its own reply, so this fails if the follow-up is lost or arrives after
+/// `TurnEnd`, if reopening shows the turn differently (a user message for the
+/// wake-up, a split turn, a lost or doubled reply), or if `agy` stops waiting,
+/// which README and harness-behavior §6 describe. Pinned to Gemini 4 Hydrogen,
+/// which starts the command in the background when asked.
 #[tokio::test]
 #[ignore = "requires antigravity installed — run with: make test-live"]
 #[serial_test::serial(antigravity)]
@@ -5114,8 +5238,8 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
             .any(|event| matches!(event, AdapterEvent::ContentChunk { .. })),
         "content arrived after TurnEnd, which the dispatcher drops; events: {events:?}"
     );
-    // The adapter emits each reply record's text as one chunk, so a chunk's
-    // words are a reply's words.
+    // The adapter emits each reply record's text as one chunk, and reopening
+    // keeps one text item per record, so separate items are separate replies.
     let live_items: Vec<&str> = events[..turn_end]
         .iter()
         .filter_map(|event| match event {
@@ -5127,10 +5251,9 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
             _ => None,
         })
         .collect();
-    let live_words: Vec<String> = live_items.iter().flat_map(|text| words(text)).collect();
     assert!(
-        ack_then_done(&live_words),
-        "the live reply must say ack, then done after the wake-up; got {live_items:?}"
+        ack_then_done_in_separate_replies(&live_items),
+        "the live turn must say ack, then done in a later reply; got {live_items:?}"
     );
     let live_reply = live_items.concat();
     let conversation_id = antigravity_capture(&events).expect("captured conversation id");
@@ -5166,10 +5289,9 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
             _ => None,
         })
         .collect();
-    let reopened_words: Vec<String> = reopened_items.iter().flat_map(|text| words(text)).collect();
     assert!(
-        ack_then_done(&reopened_words),
-        "the reopened turn must say ack, then done; got {reopened_items:?}"
+        ack_then_done_in_separate_replies(&reopened_items),
+        "the reopened turn must say ack, then done in a later reply; got {reopened_items:?}"
     );
     let reopened_reply = reopened_items.concat();
     assert_eq!(
@@ -5190,12 +5312,13 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The word `ack` appears, and `done` appears after it.
-fn ack_then_done(words: &[String]) -> bool {
-    words
+/// A reply says `ack`, and a later reply says `done`.
+fn ack_then_done_in_separate_replies(replies: &[&str]) -> bool {
+    let says = |reply: &&str, word: &str| words(reply).iter().any(|w| w == word);
+    replies
         .iter()
-        .position(|word| word == "ack")
-        .is_some_and(|ack| words[ack..].iter().any(|word| word == "done"))
+        .position(|reply| says(reply, "ack"))
+        .is_some_and(|ack| replies[ack + 1..].iter().any(|reply| says(reply, "done")))
 }
 
 // ---------------------------------------------------------------------------

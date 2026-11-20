@@ -1638,8 +1638,7 @@ fn assert_seed_completed(events: &[AdapterEvent]) {
 }
 
 /// The text of a Claude session-file record's message: the string itself, or
-/// the joined `text` blocks of a content array (thinking and tool blocks give
-/// nothing).
+/// the joined `text` blocks of a content array.
 fn session_record_text(record: &serde_json::Value) -> String {
     match record.pointer("/message/content") {
         Some(serde_json::Value::String(text)) => text.clone(),
@@ -1653,9 +1652,10 @@ fn session_record_text(record: &serde_json::Value) -> String {
 }
 
 /// Asserts the fork's session file shows a first dispatch cancelled mid-turn:
-/// the file exists, holds the inherited prompt and the interrupted one, and has
-/// no reply to the interrupted prompt. A reply is a text block; a finished
-/// thinking block may already be saved before the first text arrives.
+/// the file exists, holds the inherited prompt and then the interrupted one, and
+/// has no reply that ended the interrupted turn. A reply ended the turn when its
+/// assistant record carries a final `stop_reason`, the signal the session reader
+/// uses to call a turn complete.
 fn assert_fork_cancelled_mid_turn(child: &Path, inherited: &str, interrupted: &str) {
     let child_text = std::fs::read_to_string(child).unwrap_or_else(|error| {
         panic!(
@@ -1677,26 +1677,88 @@ fn assert_fork_cancelled_mid_turn(child: &Path, inherited: &str, interrupted: &s
                 && session_record_text(record).contains(needle)
         })
     };
-    assert!(
-        user_prompt_at(inherited).is_some(),
-        "the fork's session file must hold the inherited parent prompt ({inherited:?})"
-    );
-    let at = user_prompt_at(interrupted).unwrap_or_else(|| {
+    let inherited_at = user_prompt_at(inherited).unwrap_or_else(|| {
+        panic!("the fork's session file must hold the inherited parent prompt ({inherited:?})")
+    });
+    let interrupted_at = user_prompt_at(interrupted).unwrap_or_else(|| {
         panic!("the fork's session file must hold the interrupted prompt ({interrupted:?})")
     });
-    let replies: Vec<String> = records[at + 1..]
+    assert!(
+        inherited_at < interrupted_at,
+        "the inherited prompt must come before the interrupted one in the fork's session file"
+    );
+    // `tool_use` and `pause_turn` continue a turn, and a record saved mid-message
+    // has no `stop_reason`. Any other value, including one added later, counts as
+    // finished, so an unknown reason fails the test instead of passing it.
+    let finished: Vec<&str> = records[interrupted_at + 1..]
         .iter()
         .filter(|record| {
             record.get("type").and_then(serde_json::Value::as_str) == Some("assistant")
         })
-        .map(session_record_text)
-        .filter(|text| !text.is_empty())
+        .filter_map(|record| {
+            record
+                .pointer("/message/stop_reason")
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|reason| !matches!(*reason, "tool_use" | "pause_turn"))
         .collect();
     assert!(
-        replies.is_empty(),
-        "Claude saved a reply to the interrupted prompt, so the cancel landed after \
-         the turn finished and the retry would resume a completed fork: {replies:?}"
+        finished.is_empty(),
+        "Claude saved a reply that ended the interrupted turn (stop_reason {finished:?}), \
+         so the cancel landed after the turn finished and the retry would resume a \
+         completed fork"
     );
+}
+
+/// Dispatch one live turn and cancel it at its first content event, returning
+/// the events the stream carried. Fails if the stream has not ended within 2
+/// minutes: the dispatch stalled before any content, or the cancel did not end it.
+async fn dispatch_and_cancel_at_first_content(
+    adapter: &ClaudeCodeAdapter,
+    agent: &AgentRecord,
+    cwd: &Path,
+    prompt: &str,
+) -> Vec<AdapterEvent> {
+    let token = tokio_util::sync::CancellationToken::new();
+    let mut stream = adapter
+        .dispatch(
+            agent,
+            cwd,
+            prompt,
+            Uuid::now_v7(),
+            DispatchOptions {
+                cancel_token: token.clone(),
+                ..DispatchOptions::default()
+            },
+        )
+        .await
+        .expect("the dispatch to cancel should spawn");
+    let deadline = std::time::Duration::from_mins(2);
+    let mut events: Vec<AdapterEvent> = Vec::new();
+    let drained = tokio::time::timeout(deadline, async {
+        while let Some(event) = stream.next().await {
+            if matches!(event, AdapterEvent::ContentChunk { .. }) {
+                token.cancel();
+            }
+            events.push(event);
+        }
+    })
+    .await;
+    if drained.is_err() {
+        // The test runtime is single-threaded: the adapter kills Claude's process
+        // group only while the test keeps polling the stream after the cancel, so
+        // panicking at once would leave Claude's children running.
+        token.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while stream.next().await.is_some() {}
+        })
+        .await;
+        panic!(
+            "the dispatch did not end within {deadline:?}: it produced no content to \
+             cancel at, or the cancel did not end the stream. Events: {events:?}"
+        );
+    }
+    events
 }
 
 /// Dispatch one live turn and return its events plus the concatenated streamed
@@ -1910,46 +1972,18 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
 
     // Cancel the fork's first dispatch mid-flight, exactly as the dispatcher's
     // cancel path does (the token kills the subprocess group).
-    let token = tokio_util::sync::CancellationToken::new();
-    let mut stream = adapter
-        .dispatch(
-            &fork,
-            &cwd,
-            "Count slowly from 1 to 50, one number per line.",
-            Uuid::now_v7(),
-            DispatchOptions {
-                cancel_token: token.clone(),
-                ..DispatchOptions::default()
-            },
-        )
-        .await
-        .expect("the fork's first dispatch should spawn");
-    // Without a deadline, a dispatch that stalls before any content, or a
-    // cancel that never ends the stream, would hang the whole live run.
-    let deadline = std::time::Duration::from_mins(2);
-    let mut cancelled_events: Vec<AdapterEvent> = Vec::new();
-    let drained = tokio::time::timeout(deadline, async {
-        while let Some(event) = stream.next().await {
-            if matches!(event, AdapterEvent::ContentChunk { .. }) {
-                token.cancel();
-            }
-            cancelled_events.push(event);
-        }
-    })
+    let cancelled_events = dispatch_and_cancel_at_first_content(
+        &adapter,
+        &fork,
+        &cwd,
+        "Count slowly from 1 to 50, one number per line.",
+    )
     .await;
-    if drained.is_err() {
-        token.cancel();
-        panic!(
-            "the fork's first dispatch did not end within {deadline:?}: it produced no \
-             content to cancel at, or the cancel did not end the stream. \
-             Events: {cancelled_events:?}"
-        );
-    }
 
     // The cancel must have genuinely interrupted the turn. The adapter's
     // cancel contract is to end the stream WITHOUT a terminal event (the
     // dispatcher synthesizes the Cancelled terminal) — so any `TurnEnd` here
-    // means claude finished before the cancel landed and this run proved
+    // means the turn ended before the cancel landed and this run proved
     // nothing the happy-path test doesn't. Fail loudly rather than pass
     // vacuously.
     assert!(
@@ -1968,8 +2002,9 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
     );
 
     // The stream alone cannot prove the cancel interrupted the turn: the adapter
-    // sends `TurnEnd` only after Claude's process exits, so a cancel that lands
-    // after Claude saved its whole answer still ends the stream without one.
+    // sends a completed `TurnEnd` only after Claude's process exits, so a cancel
+    // that lands after Claude saved its whole answer still ends the stream
+    // without one.
     assert_fork_cancelled_mid_turn(
         &claude_session_file_path(&home_dir(), &cwd, &fork_session),
         "BANANA",

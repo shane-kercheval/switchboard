@@ -18861,6 +18861,147 @@ mod tests {
         );
     }
 
+    /// Whether `pid` is running, asked through `/bin/kill -0`, which sends no
+    /// signal.
+    fn process_running(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Quitting Switchboard must end a command `agy` has moved to the
+    /// background (G52 in `docs/harness-behavior.md`). This runs
+    /// `drain_agents_then_release_locks`, the function quit runs, with a real
+    /// dispatcher and a real Antigravity agent; only the window and `app.exit`
+    /// around it are left out. The command's shell writes its pid and runs a
+    /// worker, a second shell that writes its own pid, sleeps, and then
+    /// touches a marker; the trailing `echo done` keeps `zsh` from running the
+    /// worker in its own place. The drain comes once `agy` reports the command
+    /// running as a background task. Both must be gone when the drain returns,
+    /// since quit exits the app right after.
+    #[tokio::test]
+    #[ignore = "requires antigravity installed — run with: make test-live"]
+    #[serial_test::serial(antigravity)]
+    async fn live_antigravity_quit_ends_a_command_moved_to_the_background() {
+        const COMMAND_SECONDS: u64 = 25;
+        const COMMAND_WAIT_MS: u64 = 5000;
+        let tmp = TempDir::new().unwrap();
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::new(switchboard_harness::AntigravityAdapter::new()),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        if let Some(map) = TEST_DIRECTORIES.lock().unwrap().as_mut() {
+            map.remove(state.store.root());
+        }
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "quit");
+        set_active_project_impl(&state, project.id).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "agy",
+            HarnessKind::Antigravity,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        let shell_file = tmp.path().join("shell.pid");
+        let worker_file = tmp.path().join("worker.pid");
+        let marker = tmp.path().join("marker");
+        let prompt = format!(
+            "Use the run_command tool to run exactly this command, with WaitMsBeforeAsync set \
+             to {COMMAND_WAIT_MS}: echo $$ > {}; sh -c 'echo $$ > {}; sleep {COMMAND_SECONDS}; \
+             touch {}'; echo done\nThen reply with the single word ack.",
+            shell_file.display(),
+            worker_file.display(),
+            marker.display()
+        );
+        send_msg(&state, agent.id, &prompt).await.unwrap();
+
+        let command = shell_file.display().to_string();
+        let moved = tokio::time::timeout(
+            std::time::Duration::from_mins(2),
+            emitter.wait_for(|events| {
+                events.iter().any(|(_, event)| {
+                    event["type"] == "tool_completed"
+                        && event["output"].as_str().is_some_and(|output| {
+                            output.contains("running as a background task")
+                                && output.contains(&command)
+                        })
+                })
+            }),
+        )
+        .await;
+        // A pid of 0 or 1 counts as none: signalling either would reach far
+        // beyond the command.
+        let read_pid = |file: &std::path::Path| {
+            std::fs::read_to_string(file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .filter(|&pid| pid > 1)
+        };
+        let (Ok(()), Some(shell), Some(worker)) =
+            (moved, read_pid(&shell_file), read_pid(&worker_file))
+        else {
+            drain_agents_then_release_locks(
+                &state,
+                &[agent.id],
+                &[project.id],
+                CancelSource::Shutdown,
+            )
+            .await;
+            panic!(
+                "agy never reported the command running as a background task with both pids \
+                 written, so this run tested nothing; events: {:?}",
+                emitter.snapshot()
+            );
+        };
+        if shell == worker {
+            drain_agents_then_release_locks(
+                &state,
+                &[agent.id],
+                &[project.id],
+                CancelSource::Shutdown,
+            )
+            .await;
+            panic!("the worker ran in the shell's place, so this run tested nothing");
+        }
+        let found = std::time::Instant::now();
+        let running_at_quit = process_running(shell) && process_running(worker);
+        drain_agents_then_release_locks(&state, &[agent.id], &[project.id], CancelSource::Shutdown)
+            .await;
+        // Only launchd reaping the two may lag the drain.
+        let mut ended = (false, false);
+        for _ in 0..20 {
+            ended = (!process_running(shell), !process_running(worker));
+            if ended == (true, true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let finishes_at = found + std::time::Duration::from_secs(COMMAND_SECONDS + 3);
+        tokio::time::sleep_until(finishes_at.into()).await;
+        let finished = marker.exists();
+
+        assert!(
+            running_at_quit,
+            "the command ended before quit's drain, so this run tested nothing"
+        );
+        assert_eq!(
+            ended,
+            (true, true),
+            "(shell ended, worker ended) when quit's drain returned (marker touched: {finished})"
+        );
+        assert!(
+            !finished,
+            "the command ran on after quit's drain and touched its marker"
+        );
+    }
+
     #[tokio::test]
     async fn send_message_writes_send_record_to_project_journal() {
         // End-to-end through the app sink: a completed turn writes one `send`

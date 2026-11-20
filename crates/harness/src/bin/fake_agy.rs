@@ -56,10 +56,18 @@
 //!     "seconds": 8,                  //   this process holding its outputs, as a
 //!     "holds": "both",               //   background command agy started might:
 //!     "own_group": false,            //   "both", "stdout" or "stderr"; own_group puts
-//!     "ignore_term": false,          //   it in a process group of its own; ignore_term
-//!     "pid_file": "<path>"           //   makes it ignore SIGTERM; its pid is written to
-//!   }                                //   pid_file once it is set up
-//! }
+//!     "own_session": false,          //   it in a process group of its own, own_session
+//!     "ignore_term": false,          //   in a session of its own with no terminal, like
+//!     "pid_file": "<path>"           //   agy's auto-updater; ignore_term makes it ignore
+//!   },                               //   SIGTERM; its pid is written to pid_file once set up
+//!   "command_shell": {               // optional (macOS): then start a shell the way agy
+//!     "seconds": 30,                 //   runs a command: leading its own session on a
+//!     "shell_pid_file": "<path>",    //   terminal of its own, ignoring SIGHUP. It starts
+//!     "worker_pid_file": "<path>",   //   `sleep <seconds>` in a process group of its own
+//!     "ready_file": "<path>",        //   and waits for it; each writes its pid. This
+//!     "after_term": false            //   process waits for both, checks the worker's
+//!   }                                //   group, then creates ready_file. after_term starts
+//! }                                  //   it only once SIGTERM arrives, which is then held
 //! ```
 //!
 //! ## CLI log (`--log-file`)
@@ -84,6 +92,8 @@ use std::process::Stdio;
 use std::thread::sleep;
 use std::time::Duration;
 
+#[cfg(unix)]
+use nix::sys::signal::{SigSet, Signal};
 use serde::Deserialize;
 use switchboard_harness::antigravity::paths;
 use switchboard_harness::antigravity::{FAKE_AGY_INVOCATIONS_FILE, FAKE_AGY_SCRIPT_FILE};
@@ -148,6 +158,26 @@ struct Script {
     /// and keeps its output pipes open.
     #[serde(default)]
     leftover: Option<Leftover>,
+    /// A command shell to start once the leftover is running, before anything
+    /// is written.
+    #[serde(default)]
+    command_shell: Option<CommandShell>,
+}
+
+#[derive(Deserialize)]
+struct CommandShell {
+    /// How long the command's worker sleeps; the shell exits once it has.
+    seconds: u64,
+    shell_pid_file: String,
+    worker_pid_file: String,
+    /// Created once both pids are written and the worker is known to lead a
+    /// process group of its own.
+    ready_file: String,
+    /// Block SIGTERM, and start the shell only once SIGTERM arrives, so the
+    /// shell exists only while this process exits. Not for a script with a
+    /// `leftover`: it would start with SIGTERM blocked too.
+    #[serde(default)]
+    after_term: bool,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +190,10 @@ struct Leftover {
     /// this process's group.
     #[serde(default)]
     own_group: bool,
+    /// Start it in a session of its own with no terminal, as `agy` starts its
+    /// auto-updater. It writes its pid itself once the session is set up.
+    #[serde(default)]
+    own_session: bool,
     /// Ignore SIGTERM, so only a SIGKILL ends it.
     #[serde(default)]
     ignore_term: bool,
@@ -177,7 +211,15 @@ struct Leftover {
 )]
 fn start_leftover(leftover: &Leftover) {
     let seconds = leftover.seconds.to_string();
-    let mut command = if leftover.ignore_term {
+    let mut command = if leftover.own_session {
+        let exe = std::env::current_exe().unwrap_or_else(|e| {
+            eprintln!("fake_agy: cannot find its own binary: {e}");
+            std::process::exit(1);
+        });
+        let mut command = std::process::Command::new(exe);
+        command.args([LEAD_A_SESSION, leftover.pid_file.as_str(), seconds.as_str()]);
+        command
+    } else if leftover.ignore_term {
         // An ignored signal stays ignored across `exec`.
         let mut command = std::process::Command::new("sh");
         command.args([
@@ -207,8 +249,128 @@ fn start_leftover(leftover: &Leftover) {
         eprintln!("fake_agy: cannot start the leftover: {e}");
         std::process::exit(1);
     });
-    if !leftover.ignore_term {
+    if !leftover.ignore_term && !leftover.own_session {
         write_pid(&leftover.pid_file, child.id());
+    }
+}
+
+/// The argument that runs this binary as a leftover leading a session of its
+/// own: `fake_agy --lead-a-session <pid_file> <seconds>`.
+const LEAD_A_SESSION: &str = "--lead-a-session";
+
+/// When run as `fake_agy --lead-a-session <pid_file> <seconds>`, start a
+/// session with no terminal, write this process's pid to `pid_file`, and
+/// become `sleep <seconds>`.
+#[cfg(unix)]
+fn lead_a_session_if_asked(args: &[String]) {
+    let [_, flag, pid_file, seconds] = args else {
+        return;
+    };
+    if flag != LEAD_A_SESSION {
+        return;
+    }
+    if let Err(e) = nix::unistd::setsid() {
+        eprintln!("fake_agy: cannot start a session: {e}");
+        std::process::exit(1);
+    }
+    write_pid(pid_file, std::process::id());
+    let e = std::process::Command::new("sleep").arg(seconds).exec();
+    eprintln!("fake_agy: cannot run sleep: {e}");
+    std::process::exit(1);
+}
+
+/// For a command shell started only once SIGTERM arrives, block SIGTERM and
+/// return the set to wait on. Called while this is the only thread, so no
+/// other thread can take the SIGTERM instead.
+#[cfg(unix)]
+fn block_sigterm_for(shell: Option<&CommandShell>) -> Option<SigSet> {
+    if !shell.is_some_and(|shell| shell.after_term) {
+        return None;
+    }
+    let mut set = SigSet::empty();
+    set.add(Signal::SIGTERM);
+    if let Err(e) = set.thread_block() {
+        eprintln!("fake_agy: cannot block SIGTERM: {e}");
+        std::process::exit(1);
+    }
+    Some(set)
+}
+
+/// Wait for the SIGTERM `held` blocks, then start `shell`.
+#[cfg(unix)]
+fn start_command_shell_on_sigterm(held: SigSet, shell: &CommandShell) {
+    if let Err(e) = held.wait() {
+        eprintln!("fake_agy: cannot wait for SIGTERM: {e}");
+        std::process::exit(1);
+    }
+    // `std::process::Command` passes the signal mask on to a child, so the
+    // shell would otherwise start with SIGTERM blocked too.
+    if let Err(e) = held.thread_unblock() {
+        eprintln!("fake_agy: cannot unblock SIGTERM: {e}");
+        std::process::exit(1);
+    }
+    start_command_shell(shell);
+}
+
+/// Start `shell` the way `agy` starts a command, and return once the shell
+/// and its worker have written their pids and the ready file is created.
+///
+/// `agy` runs each command as `zsh -c <command>` leading its own session on a
+/// terminal it opens, with SIGHUP ignored, so the shell outlives `agy`.
+/// `script` gives the shell that session and terminal without `unsafe`, which
+/// the workspace forbids; the shell is this process's grandchild, through
+/// `script`, which stays in this process's group. `set -m` starts the worker
+/// in a process group of its own, which it can do because it has a terminal.
+fn start_command_shell(shell: &CommandShell) {
+    let seconds = shell.seconds.to_string();
+    let spawned = std::process::Command::new("/usr/bin/script")
+        .args([
+            "-q",
+            "/dev/null",
+            "/bin/sh",
+            "-c",
+            r#"set -m; trap "" HUP; sleep "$2" & echo $! > "$1.tmp" && mv "$1.tmp" "$1"; echo $$ > "$0.tmp" && mv "$0.tmp" "$0"; wait"#,
+            shell.shell_pid_file.as_str(),
+            shell.worker_pid_file.as_str(),
+            seconds.as_str(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Err(e) = spawned {
+        eprintln!("fake_agy: cannot start the command shell: {e}");
+        std::process::exit(1);
+    }
+    // The shell writes its pid after the worker's, so this waits for both.
+    for _ in 0..1000 {
+        if std::path::Path::new(&shell.shell_pid_file).exists() {
+            #[cfg(unix)]
+            check_worker_group(&shell.worker_pid_file);
+            if let Err(e) = std::fs::write(&shell.ready_file, "") {
+                eprintln!("fake_agy: cannot create the ready file: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        sleep(Duration::from_millis(10));
+    }
+    eprintln!("fake_agy: the command shell never wrote its pid");
+    std::process::exit(1);
+}
+
+/// Exit with an error unless the worker leads a process group of its own, so
+/// a test that relies on a second group cannot pass without one.
+#[cfg(unix)]
+fn check_worker_group(worker_pid_file: &str) {
+    let worker = std::fs::read_to_string(worker_pid_file)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+        .map(nix::unistd::Pid::from_raw);
+    let own_group = worker.is_some_and(|pid| nix::unistd::getpgid(Some(pid)) == Ok(pid));
+    if !own_group {
+        eprintln!("fake_agy: the command's worker is not in a process group of its own");
+        std::process::exit(1);
     }
 }
 
@@ -270,8 +432,43 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+/// Write `script`'s transcript records into the (possibly fresh)
+/// conversation dir under `home`. Skipped when `create_brain_dir` is false,
+/// which models a broken transcript path, leaving the producer unable to
+/// locate the conversation.
+fn write_transcript(script: &Script, home: &std::path::Path) {
+    let uuid = Uuid::parse_str(&script.conversation_uuid).unwrap_or_else(|e| {
+        eprintln!("fake_agy: bad conversation_uuid: {e}");
+        std::process::exit(1);
+    });
+    let transcript = paths::transcript_path(home, uuid);
+    if let Some(parent) = transcript.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&transcript)
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "fake_agy: cannot open transcript {}: {e}",
+                transcript.display()
+            );
+            std::process::exit(1);
+        });
+    for rec in &script.records {
+        if rec.delay_ms > 0 {
+            sleep(Duration::from_millis(rec.delay_ms));
+        }
+        let _ = writeln!(file, "{}", rec.json);
+        let _ = file.flush();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(unix)]
+    lead_a_session_if_asked(&args);
 
     // Read the script first. Argv logging happens only *after* a script loads,
     // so a scriptless invocation in the crate dir (the adapter's cwd-agnostic
@@ -286,6 +483,8 @@ fn main() {
         eprintln!("fake_agy: malformed {FAKE_AGY_SCRIPT_FILE}: {e}");
         std::process::exit(1);
     });
+    #[cfg(unix)]
+    let held_term = block_sigterm_for(script.command_shell.as_ref());
 
     // Record this invocation's argv so tests can assert passed flags (e.g.
     // `--conversation <healed-uuid>` on the post-fork resume).
@@ -302,6 +501,11 @@ fn main() {
     }
     if let Some(leftover) = &script.leftover {
         start_leftover(leftover);
+    }
+    if let Some(shell) = &script.command_shell
+        && !shell.after_term
+    {
+        start_command_shell(shell);
     }
 
     stage_log(&args, &script);
@@ -321,36 +525,8 @@ fn main() {
         let _ = err.flush();
     }
 
-    // Write transcript records into the (possibly fresh) conversation dir.
-    // Skipped entirely when `create_brain_dir` is false — that models a broken
-    // transcript path, leaving the producer unable to locate the conversation.
     if script.create_brain_dir {
-        let uuid = Uuid::parse_str(&script.conversation_uuid).unwrap_or_else(|e| {
-            eprintln!("fake_agy: bad conversation_uuid: {e}");
-            std::process::exit(1);
-        });
-        let transcript = paths::transcript_path(&home, uuid);
-        if let Some(parent) = transcript.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&transcript)
-            .unwrap_or_else(|e| {
-                eprintln!(
-                    "fake_agy: cannot open transcript {}: {e}",
-                    transcript.display()
-                );
-                std::process::exit(1);
-            });
-        for rec in &script.records {
-            if rec.delay_ms > 0 {
-                sleep(Duration::from_millis(rec.delay_ms));
-            }
-            let _ = writeln!(file, "{}", rec.json);
-            let _ = file.flush();
-        }
+        write_transcript(&script, &home);
     }
 
     // Drip the model's answer to stdout (the live-text source).
@@ -380,6 +556,11 @@ fn main() {
         }
         let _ = writeln!(err, "{}", line.text);
         let _ = err.flush();
+    }
+
+    #[cfg(unix)]
+    if let (Some(held), Some(shell)) = (held_term, &script.command_shell) {
+        start_command_shell_on_sigterm(held, shell);
     }
 
     if script.hang {

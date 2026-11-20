@@ -68,6 +68,8 @@
 //!
 //! Ground-truth reference: `docs/research/archive/antigravity-cli-observed.md`.
 
+#[cfg(target_os = "macos")]
+mod command_shells;
 pub mod config;
 pub(crate) mod facets;
 pub mod parser;
@@ -557,17 +559,41 @@ async fn finish_stderr(
 
 /// Stop `agy` and the processes it started. While `agy` runs, its group is
 /// signalled through it ([`crate::subprocess::terminate_then_kill`]: SIGTERM,
-/// a grace for `agy` to exit, SIGKILL). Once it has exited and been reaped,
-/// `child` no longer knows its pid, so the group is signalled through the id
-/// saved at spawn: SIGTERM, a short grace for the group to empty, SIGKILL.
-/// A process that moved itself out of the group is beyond either; the
-/// post-exit limit still bounds the turn.
-async fn stop_process_tree(child: &mut tokio::process::Child, leader: Option<u32>) {
-    if child.id().is_some() {
-        crate::subprocess::terminate_then_kill(child).await;
+/// a grace for `agy` to exit, SIGKILL), and on macOS the commands it runs on
+/// terminals of their own, outside that group, are ended once it is gone
+/// (`command_shells`). Once it has exited and been reaped, `child` no longer
+/// knows its pid, so the group is signalled through the id saved at spawn:
+/// SIGTERM, a short grace for the group to empty, SIGKILL. An `agy` that
+/// exited on its own had waited for its commands, and they could no longer be
+/// found by parent anyway. Any other process that moved itself out of the
+/// group is beyond either; the post-exit limit still bounds the turn.
+async fn stop_process_tree(
+    child: &mut tokio::process::Child,
+    leader: Option<u32>,
+    turn_id: TurnId,
+) {
+    if let Some(agy) = child.id() {
+        stop_running_agy(child, agy, turn_id).await;
     } else if let Some(leader) = leader {
         crate::subprocess::terminate_then_kill_group(leader).await;
     }
+}
+
+/// Kill a running `agy`'s group, recording the command shells under it and
+/// the processes under them from just before the SIGTERM until it exits, then
+/// end those still running. Ending them only once `agy` is gone keeps `agy`
+/// from seeing its command die and acting on it while it shuts down.
+#[cfg(target_os = "macos")]
+async fn stop_running_agy(child: &mut tokio::process::Child, agy: u32, turn_id: TurnId) {
+    let mut shells = command_shells::CommandShells::new(turn_id);
+    shells.record(agy).await;
+    crate::subprocess::terminate_then_kill_while(child, shells.keep_recording(agy)).await;
+    shells.end(agy).await;
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn stop_running_agy(child: &mut tokio::process::Child, _agy: u32, _turn_id: TurnId) {
+    crate::subprocess::terminate_then_kill(child).await;
 }
 
 /// The exact text handed to `agy -p` for a given dispatch prompt.
@@ -1041,7 +1067,7 @@ async fn run_producer(ctx: ProducerCtx) {
         // post-exit recapture / `classify_outcome` / `TurnEnd` / `SessionMeta`
         // below. Kill before awaiting the stderr drain — a parked subprocess
         // holds stderr open.
-        stop_process_tree(&mut child, leader).await;
+        stop_process_tree(&mut child, leader, turn_id).await;
         let deadline = *exit_deadline.get_or_insert(tokio::time::Instant::now() + POST_EXIT_LIMIT);
         finish_stderr(&mut stderr_task, &stderr, deadline, turn_id, agent_id).await;
         let _ = std::fs::remove_file(&log_file_path);
@@ -1049,10 +1075,10 @@ async fn run_producer(ctx: ProducerCtx) {
     }
 
     // Force-kill if we broke out while the child may still be running (auth
-    // fast-fail, or capture timeout with the process hung on OAuth).
-    // `terminate_then_kill` reaps the child itself, so no trailing `wait`.
+    // fast-fail, or an ambiguous capture). The kill reaps the child itself, so
+    // no trailing `wait`.
     if exit_status.is_none() {
-        crate::subprocess::terminate_then_kill(&mut child).await;
+        stop_process_tree(&mut child, leader, turn_id).await;
     }
     // Drain stderr before scanning it for the resume-not-found signal below,
     // within the same deadline as stdout. A Stop that arrives meanwhile still
@@ -1066,7 +1092,7 @@ async fn run_producer(ctx: ProducerCtx) {
         () = finish_stderr(&mut stderr_task, &stderr, deadline, turn_id, agent_id) => false,
     };
     if stopped {
-        stop_process_tree(&mut child, leader).await;
+        stop_process_tree(&mut child, leader, turn_id).await;
         finish_stderr(&mut stderr_task, &stderr, deadline, turn_id, agent_id).await;
         let _ = std::fs::remove_file(&log_file_path);
         return;

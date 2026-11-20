@@ -1753,6 +1753,19 @@ pub fn format_stderr_tail(tail: &Mutex<VecDeque<String>>) -> String {
 /// Cross-platform: non-unix has no process-group concept, so it falls back to
 /// `child.kill()` (SIGKILL-equivalent).
 pub async fn terminate_then_kill(child: &mut tokio::process::Child) {
+    terminate_then_kill_while(child, std::future::pending()).await;
+}
+
+/// [`terminate_then_kill`], polling `meanwhile` while the parent has its grace
+/// to exit, for a caller that watches the parent's children up to the moment
+/// it exits: after that they belong to init and can no longer be found by
+/// parent. `meanwhile` is dropped when the parent exits or the grace ends; if
+/// it finishes first, the wait goes on without it. On non-unix it is never
+/// polled.
+pub async fn terminate_then_kill_while(
+    child: &mut tokio::process::Child,
+    meanwhile: impl std::future::Future<Output = ()>,
+) {
     #[cfg(unix)]
     {
         let Some(pid) = child.id() else {
@@ -1765,12 +1778,23 @@ pub async fn terminate_then_kill(child: &mut tokio::process::Child) {
         // Give the parent the grace window to flush + exit on SIGTERM. We
         // ignore the result: whether it exited or timed out, the unconditional
         // group SIGKILL below is what guarantees teardown (see doc).
-        let _ = tokio::time::timeout(TERMINATE_GRACE, child.wait()).await;
+        {
+            let exited = tokio::time::timeout(TERMINATE_GRACE, child.wait());
+            tokio::pin!(exited);
+            tokio::select! {
+                biased;
+                _ = &mut exited => {}
+                () = meanwhile => {
+                    let _ = exited.await;
+                }
+            }
+        }
         killpg_signal(group, nix::sys::signal::Signal::SIGKILL);
         let _ = child.wait().await;
     }
     #[cfg(not(unix))]
     {
+        drop(meanwhile);
         let _ = child.kill().await;
     }
 }

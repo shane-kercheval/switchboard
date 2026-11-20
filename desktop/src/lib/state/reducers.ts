@@ -789,9 +789,12 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         // `agent_idle` between queued turns. It always arrives after the
         // previous turn's `turn_end`, though, since the dispatcher runs one item
         // at a time, so no turn is running. Only a failure naming its send
-        // counts: a shutdown's abandoned items carry no send id. One arriving
-        // while a turn runs is stale. One arriving while a send is pending is
-        // dropped: that send's turn will replace it.
+        // counts: the dispatcher sends none for a journal-write failure, a
+        // preflight or prompt-size refusal, or a shutdown's abandoned items. One
+        // arriving while a turn runs is stale. One arriving while a send is
+        // pending is dropped, because that send's turn usually starts next and
+        // clears it; when the pending send is a context report or is cancelled
+        // before it starts, the card loses the failure.
         const isWorkflowFailure =
           input.send_id !== null &&
           runtime.turn_started_at === undefined &&

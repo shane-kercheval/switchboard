@@ -211,19 +211,19 @@ Since Claude Code 2.1.277, the cost and token totals on a resumed turn's `result
 - `resolve_step_display` and the run start that calls it in `desktop/src-tauri/src/workflow_commands.rs`.
 - `workflowTargets` in `desktop/src/lib/state/agentActivity.svelte.ts`.
 
-## A workflow recipient written with whitespace-control dashes shows as raw template text
+## A workflow recipient written as an expression shows as raw template text
 
-**What a user would get.** A workflow step addressed to `{{- reviewer -}}` shows the bound agent's name in the run's progress view, and that agent's card reads "Waiting for" before its step, as it does for `{{ reviewer }}`.
+**What a user would get.** A workflow step addressed to a recipient expression such as `{{- reviewer -}}` or `{{ reviewer | trim }}` shows the bound agent's name in the run's progress view, and that agent's card reads "Waiting for" before its step, as it does for `{{ reviewer }}`.
 
 **What we know.** Read from source on 2026-11-20.
 
-- The engine accepts the dashes: `pure_expression` in `crates/workflow/src/template.rs` strips them before evaluating an agent reference.
-- The display layer does not: `single_var` in `crates/workflow/src/display.rs` requires a bare `{{ name }}`, so `{{- reviewer -}}` is classified as a literal and shown verbatim. The progress view then shows the raw template, and the agent card never matches it to an agent.
-- No built-in workflow uses the dashes in a recipient.
+- The engine resolves both examples: `pure_expression` in `crates/workflow/src/template.rs` strips the optional whitespace-control dashes from a whole-string `{{ ... }}` recipient, and `resolve_agent_refs` evaluates what remains as an expression. The result must be an agent name or a list of names; an expression that gives anything else, such as a number from `length`, fails the step.
+- The display layer does not: `single_var` in `crates/workflow/src/display.rs` requires a bare `{{ name }}`, so `{{- reviewer -}}` and `{{ reviewer | trim }}` are classified as literals and shown verbatim. The progress view then shows the raw template, and the agent card never matches it to an agent.
+- No built-in workflow uses dashes or a filter in a recipient.
 
 **Why it waits.** It predates the agent card's waiting state and is a separate fix in the workflow crate.
 
-**A candidate approach.** This is recorded, not decided. One option is for `single_var` to strip the optional dashes the same way `pure_expression` does, with a test for `{{- name -}}`.
+**A candidate approach.** This is recorded, not decided. One option is for the display to resolve a recipient the way the engine does, through `pure_expression` and the same expression evaluation over the run's bound inputs, with tests for `{{- name -}}` and `{{ name | trim }}`.
 
 **Where the detail is.**
 

@@ -16,10 +16,12 @@
 //! servers, which run in `agy`'s own group.
 //!
 //! macOS lists a process being debugged under its debugger, so it may never
-//! have been under a command at all. Such a process is not recorded, the walk
-//! does not go below it, and it never makes its group a target; a recorded
-//! process seen being debugged is dropped from the record with every process
-//! under it.
+//! have been under a command at all, and it clears the traced flag as the
+//! process exits but leaves it under the debugger until the debugger reaps
+//! it. So a process being debugged, exiting, or a zombie is not recorded, the
+//! walk does not go below it, it never makes its group a target, and it is no
+//! reason for SIGKILL. A recorded process seen being debugged is also dropped
+//! from the record with every process under it.
 //!
 //! Processes are read from `/bin/ps`: calling libproc directly needs the
 //! `unsafe` the workspace forbids, and the `libproc` crate needs libclang to
@@ -46,6 +48,10 @@ const POLL: Duration = Duration::from_millis(20);
 
 /// One row of `ps` output.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is a separate flag `ps` prints, not a state"
+)]
 struct Process {
     pid: u32,
     ppid: u32,
@@ -53,9 +59,20 @@ struct Process {
     session_leader: bool,
     has_terminal: bool,
     traced: bool,
+    /// Exiting or a zombie.
+    exiting: bool,
     /// `ps`'s start time, compared only for equality: the same pid with a
     /// different start time is another process.
     started: String,
+}
+
+impl Process {
+    /// Whether this row's parent can be taken as the process that started it:
+    /// not so for one being debugged, or for one exiting or a zombie, which
+    /// may still be listed under a debugger.
+    fn has_own_parent(&self) -> bool {
+        !self.traced && !self.exiting
+    }
 }
 
 /// Processes seen in earlier listings: each one's pid, with the start time it
@@ -110,9 +127,10 @@ impl<'a> Tree<'a> {
     }
 
     /// The command shells under `agy`: descendants, reached through processes
-    /// not being debugged, that lead their own session and have a terminal.
+    /// with their own parents, that lead their own session and have a
+    /// terminal.
     fn shells_under(&self, agy: u32) -> Vec<&'a Process> {
-        self.below([agy], |process| !process.traced)
+        self.below([agy], Process::has_own_parent)
             .into_iter()
             .filter(|process| {
                 process.session_leader && process.has_terminal && process.pgid == process.pid
@@ -122,7 +140,7 @@ impl<'a> Tree<'a> {
 
     /// The processes in this listing that `known` accepts, split into those
     /// to follow and those to drop: each one being debugged, and each one
-    /// under one of those.
+    /// under one of those. One exiting, or a zombie, is in neither.
     fn split_known(
         &self,
         known: impl Fn(&Process) -> bool,
@@ -131,13 +149,16 @@ impl<'a> Tree<'a> {
         let debugged: Vec<u32> = running.iter().filter(|p| p.traced).map(|p| p.pid).collect();
         let mut dropped: HashSet<u32> = debugged.iter().copied().collect();
         dropped.extend(self.below(debugged, |_| true).iter().map(|p| p.pid));
-        running.into_iter().partition(|p| !dropped.contains(&p.pid))
+        let (mut kept, dropped): (Vec<&'a Process>, Vec<&'a Process>) =
+            running.into_iter().partition(|p| !dropped.contains(&p.pid));
+        kept.retain(|p| !p.exiting);
+        (kept, dropped)
     }
 
-    /// `roots` and every process under them, reached through processes not
-    /// being debugged.
+    /// `roots` and every process under them, reached through processes with
+    /// their own parents.
     fn with_everything_under(&self, mut roots: Vec<&'a Process>) -> Vec<&'a Process> {
-        let under = self.below(roots.iter().map(|p| p.pid), |p| !p.traced);
+        let under = self.below(roots.iter().map(|p| p.pid), Process::has_own_parent);
         roots.extend(under);
         roots
     }
@@ -345,10 +366,12 @@ fn parse_process(line: &str) -> Option<Process> {
         ppid: parent.parse().ok()?,
         pgid: group.parse().ok()?,
         // `ps` marks a session leader with a lowercase `s` among its state
-        // flags and a process being debugged with `X`.
+        // flags, a process being debugged with `X`, one exiting with `E`, and
+        // a zombie with a leading `Z`.
         session_leader: stat.contains('s'),
         has_terminal: is_pseudo_terminal(tt),
         traced: stat.contains('X'),
+        exiting: stat.starts_with('Z') || stat.contains('E'),
         started: started.to_owned(),
     })
 }
@@ -370,9 +393,10 @@ fn next_field(text: &str) -> Option<(&str, &str)> {
 }
 
 /// The process groups `members` are in. Each member was found under a shell
-/// through parents not being debugged, and a shell leads its own session, in
-/// which every process was forked from one already in it, so each of these
-/// groups holds only processes started under a shell. Groups 0 and 1, `agy`'s
+/// through processes with their own parents, and each is in the shell's
+/// session or in one a process under the shell started, in which every
+/// process was forked from one already in it, so each of these groups holds
+/// only processes started under a shell. Groups 0 and 1, `agy`'s
 /// group and Switchboard's own group (`own`) are left out all the same.
 fn groups_of(members: &[&Process], agy: u32, own: u32) -> BTreeSet<u32> {
     members
@@ -383,9 +407,9 @@ fn groups_of(members: &[&Process], agy: u32, own: u32) -> BTreeSet<u32> {
 }
 
 /// The groups in `groups` that still hold one of `members`: a process in
-/// `processes` with a member's pid, start time and group, not being debugged
-/// and not under a member that is. A group holding one is still the group
-/// recorded, whatever else has joined it.
+/// `processes` with a member's pid, start time and group, not being debugged,
+/// exiting or a zombie, and not under a member being debugged. A group
+/// holding one is still the group recorded, whatever else has joined it.
 fn still_held(
     processes: &[Process],
     members: &[&Process],
@@ -462,6 +486,7 @@ mod tests {
                 session_leader: true,
                 has_terminal: true,
                 traced: false,
+                exiting: false,
                 started: "Thu Nov 19 23:29:21 2026".to_owned(),
             })
         );
@@ -596,6 +621,59 @@ mod tests {
         );
     }
 
+    /// After `agy` exits: the target `debugserver` (9031) attached to long
+    /// before the Stop (700, outside `agy`'s tree, sharing its group with 702)
+    /// is exiting or has exited, with `stat` as its state. macOS clears the
+    /// traced flag as a process exits and gives it back its own parent only
+    /// when the debugger reaps it, so `ps` lists it under the debugger with no
+    /// `X`.
+    fn exited_target_rows(stat: &str) -> Vec<Process> {
+        parse_processes(&format!(
+            " 9022     1  9022 Ss+  s001  Thu Nov 19 23:29:21 2026
+ 9030  9022  9022 S+   s001  Thu Nov 19 23:29:22 2026
+ 9031  9030  9022 S+   s001  Thu Nov 19 23:29:22 2026
+  700  9031   700 {stat:<4}   ??  Thu Nov 19 08:00:01 2026
+  702   650   700 S+   s002  Thu Nov 19 08:00:09 2026
+"
+        ))
+        .unwrap()
+    }
+
+    /// A zombie, and a process still exiting.
+    const EXITED: [&str; 2] = ["Z", "REs"];
+
+    #[test]
+    fn an_exited_debug_target_does_not_make_its_group_a_target() {
+        for stat in EXITED {
+            let mut shells = noted(&[&debugger_rows(Some(("SXs+", 9031)))]);
+            let now = exited_target_rows(stat);
+            let members = shells.follow_shells(&now);
+            assert_eq!(pids(&members), vec![9022, 9030, 9031], "{stat}");
+            assert_eq!(
+                groups_of(&members, AGY, OWN),
+                BTreeSet::from([9022]),
+                "{stat}: 702 shares a group with 700 and was never recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exited_member_is_no_reason_for_sigkill() {
+        let racy = debugger_rows(None);
+        let members = noted(&[]).follow_shells(&racy);
+        for stat in EXITED {
+            assert_eq!(
+                still_held(
+                    &exited_target_rows(stat),
+                    &members,
+                    &BTreeSet::from([9022, 700])
+                ),
+                BTreeSet::from([9022]),
+                "{stat}: 702 shares a group with 700 and was never recorded"
+            );
+        }
+    }
+
     #[test]
     fn a_process_seen_under_a_shell_is_ended_after_the_shell_exits() {
         let mut shells = noted(&[&probe()]);
@@ -628,6 +706,7 @@ mod tests {
             session_leader: false,
             has_terminal: false,
             traced: false,
+            exiting: false,
             started: "Thu Nov 19 23:29:21 2026".to_owned(),
         });
         let members: Vec<&Process> = members.iter().collect();

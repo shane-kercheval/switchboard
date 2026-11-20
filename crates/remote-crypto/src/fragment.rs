@@ -26,7 +26,7 @@ pub const MAX_CHUNK_LEN: usize = MAX_FRAGMENT_LEN - HEADER_LEN;
 /// Largest message the reassembler accepts.
 pub const MAX_MESSAGE_LEN: usize = 8 * 1024 * 1024;
 /// Most fragments a message within `MAX_MESSAGE_LEN` can need.
-const MAX_FRAGMENT_COUNT: usize = MAX_MESSAGE_LEN.div_ceil(MAX_CHUNK_LEN);
+pub const MAX_FRAGMENT_COUNT: usize = MAX_MESSAGE_LEN.div_ceil(MAX_CHUNK_LEN);
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FragmentError {

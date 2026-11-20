@@ -1,0 +1,5 @@
+{
+  "type": "error",
+  "code": "registration_refused",
+  "message": "the signature does not answer the challenge"
+}

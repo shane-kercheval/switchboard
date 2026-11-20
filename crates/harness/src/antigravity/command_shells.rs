@@ -3,27 +3,31 @@
 //!
 //! `agy` runs each `run_command` call as `zsh -c <command>`, leading its own
 //! session on a terminal `agy` opens, outside the process group the adapter
-//! signals, and with SIGHUP ignored. Once `agy` exits the shell belongs to
-//! launchd and runs on, so killing `agy` alone would leave a long build or test
-//! changing files (G52 in `docs/harness-behavior.md`). The shells can be found
-//! only while `agy` is alive, by walking its process tree, so they are
-//! recorded then and their process groups are signalled once `agy` is gone.
+//! signals, and with SIGHUP ignored or handled. Once `agy` exits the shell
+//! belongs to launchd and runs on, so killing `agy` alone would leave a long
+//! build or test changing files (G52 in `docs/harness-behavior.md`). The
+//! shells can be found only while `agy` is alive, by walking its process tree,
+//! so they and every process under them are recorded then, and the process
+//! groups of those still running are signalled once `agy` is gone.
 //!
 //! A command shell is a descendant of `agy` that leads its own session and has
-//! a controlling terminal. That leaves out `agy --bg-updater`, the
-//! auto-updater, which leads a session with no terminal and is meant to
-//! outlive `agy`, and MCP servers, which run in `agy`'s own group.
+//! a terminal. That leaves out `agy --bg-updater`, the auto-updater, which
+//! leads a session with no terminal and is meant to outlive `agy`, and MCP
+//! servers, which run in `agy`'s own group. The walk does not enter a process
+//! being debugged: macOS reports a debugged process's debugger as its parent.
 //!
-//! Processes are read from `/bin/ps`, since the workspace forbids the `unsafe`
-//! that libproc calls need. If `ps` fails or its output does not parse,
-//! nothing is signalled and the kill is the group kill alone.
+//! Processes are read from `/bin/ps`: calling libproc directly needs the
+//! `unsafe` the workspace forbids, and the `libproc` crate needs libclang to
+//! build. A listing that fails or does not parse is skipped, so nothing is
+//! signalled, and the kill is the group kill alone, when no listing before
+//! `agy` exits records a shell or when the listing after it exits fails.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::process::Stdio;
 use std::time::Duration;
 
 use nix::sys::signal::{Signal, killpg};
-use nix::unistd::Pid;
+use nix::unistd::{Pid, getpgrp};
 
 use crate::events::TurnId;
 use crate::subprocess::TERMINATE_GRACE;
@@ -43,17 +47,27 @@ struct Process {
     pgid: u32,
     session_leader: bool,
     has_terminal: bool,
+    traced: bool,
     /// `ps`'s start time, compared only for equality: the same pid with a
     /// different start time is another process.
     started: String,
 }
 
-/// A process recorded in one snapshot, to be found again in a later one.
+/// A process seen in one snapshot, to be found again in a later one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Recorded {
     pid: u32,
     started: String,
+    /// The group it was in when seen.
     pgid: u32,
+}
+
+impl Recorded {
+    /// Whether `process` is this process: the same pid with another start
+    /// time is another process.
+    fn is(&self, process: &Process) -> bool {
+        self.pid == process.pid && self.started == process.started
+    }
 }
 
 impl From<&Process> for Recorded {
@@ -66,11 +80,12 @@ impl From<&Process> for Recorded {
     }
 }
 
-/// The command shells seen under one `agy`.
+/// The command shells seen under one `agy`, and every process seen under
+/// them.
 #[derive(Debug)]
 pub(super) struct CommandShells {
     turn_id: TurnId,
-    shells: Vec<Recorded>,
+    recorded: Vec<Recorded>,
     warned: bool,
 }
 
@@ -78,19 +93,34 @@ impl CommandShells {
     pub(super) fn new(turn_id: TurnId) -> Self {
         Self {
             turn_id,
-            shells: Vec::new(),
+            recorded: Vec::new(),
             warned: false,
         }
     }
 
-    /// Add the command shells now under `agy`.
+    /// Add the command shells now under `agy` and every process now under a
+    /// recorded process.
     pub(super) async fn record(&mut self, agy: u32) {
-        let Some(processes) = self.snapshot().await else {
-            return;
-        };
-        for shell in shells_under(&processes, agy) {
-            if !self.shells.contains(&shell) {
-                self.shells.push(shell);
+        if let Some(processes) = self.snapshot().await {
+            self.note(&processes, agy);
+        }
+    }
+
+    fn note(&mut self, processes: &[Process], agy: u32) {
+        let shells = shells_under(processes, agy);
+        self.add(shells);
+        let under = still_under(processes, &self.recorded);
+        self.add(under);
+    }
+
+    fn add(&mut self, found: Vec<Recorded>) {
+        for found in found {
+            if !self
+                .recorded
+                .iter()
+                .any(|known| known.pid == found.pid && known.started == found.started)
+            {
+                self.recorded.push(found);
             }
         }
     }
@@ -104,19 +134,19 @@ impl CommandShells {
         }
     }
 
-    /// End the recorded shells and everything under them, once `agy` has been
-    /// reaped: SIGTERM each process group they hold, wait up to
-    /// [`TERMINATE_GRACE`] for those groups to empty, then SIGKILL a group
-    /// that still holds a recorded process.
+    /// End the recorded processes still running and everything under them,
+    /// once `agy` has been reaped: SIGTERM each process group they are in,
+    /// wait up to [`TERMINATE_GRACE`] for those groups to empty, then SIGKILL
+    /// a group that a new listing shows still holds one of them.
     pub(super) async fn end(mut self, agy: u32) {
-        if self.shells.is_empty() {
+        if self.recorded.is_empty() {
             return;
         }
         let Some(now) = self.snapshot().await else {
             return;
         };
-        let members = still_under(&now, &self.shells);
-        let groups = groups_of(&members, agy);
+        let members = still_under(&now, &self.recorded);
+        let groups = groups_of(&members, agy, getpgrp().as_raw().cast_unsigned());
         if groups.is_empty() {
             return;
         }
@@ -222,11 +252,21 @@ fn parse_process(line: &str) -> Option<Process> {
         ppid: parent.parse().ok()?,
         pgid: group.parse().ok()?,
         // `ps` marks a session leader with a lowercase `s` among its state
-        // flags, and a process with no controlling terminal with `??`.
+        // flags and a process being debugged with `X`.
         session_leader: stat.contains('s'),
-        has_terminal: tt != "??",
+        has_terminal: is_pseudo_terminal(tt),
+        traced: stat.contains('X'),
         started: started.to_owned(),
     })
+}
+
+/// Whether `ps` names a pseudo-terminal, as `agy` opens for a command: `s`
+/// and digits, from `/dev/ttys001`. Anything else counts as no terminal,
+/// including `??` for none and a trailing `-` for a revoked one, so a change
+/// in how `ps` writes the column spares a process rather than ending it.
+fn is_pseudo_terminal(tt: &str) -> bool {
+    tt.strip_prefix('s')
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The first whitespace-separated field of `text`, and what follows it.
@@ -236,11 +276,13 @@ fn next_field(text: &str) -> Option<(&str, &str)> {
     Some((&text[..end], &text[end..]))
 }
 
-/// Every process under `root`, not counting `root`.
+/// Every process under `root`, not counting `root`. The walk does not enter a
+/// process being debugged: macOS reports its debugger as its parent, so it
+/// may have been started anywhere.
 fn descendants(processes: &[Process], root: u32) -> Vec<&Process> {
     let mut children: HashMap<u32, Vec<&Process>> = HashMap::new();
     for process in processes {
-        if process.pid != process.ppid {
+        if process.pid != process.ppid && !process.traced {
             children.entry(process.ppid).or_default().push(process);
         }
     }
@@ -259,7 +301,7 @@ fn descendants(processes: &[Process], root: u32) -> Vec<&Process> {
 }
 
 /// The command shells under `agy`: descendants that lead their own session
-/// and have a controlling terminal.
+/// and have a terminal.
 fn shells_under(processes: &[Process], agy: u32) -> Vec<Recorded> {
     descendants(processes, agy)
         .into_iter()
@@ -270,15 +312,13 @@ fn shells_under(processes: &[Process], agy: u32) -> Vec<Recorded> {
         .collect()
 }
 
-/// The recorded shells still running in `processes`, each found by its pid
-/// and start time, and every process under them.
-fn still_under(processes: &[Process], shells: &[Recorded]) -> Vec<Recorded> {
+/// The recorded processes still running in `processes`, each found by its
+/// pid and start time, and every process under them, with the groups they
+/// are in now.
+fn still_under(processes: &[Process], recorded: &[Recorded]) -> Vec<Recorded> {
     let mut members = Vec::new();
-    for shell in shells {
-        let Some(running) = processes
-            .iter()
-            .find(|process| process.pid == shell.pid && process.started == shell.started)
-        else {
+    for known in recorded {
+        let Some(running) = processes.iter().find(|process| known.is(process)) else {
             continue;
         };
         for process in std::iter::once(running).chain(descendants(processes, running.pid)) {
@@ -291,15 +331,16 @@ fn still_under(processes: &[Process], shells: &[Recorded]) -> Vec<Recorded> {
     members
 }
 
-/// The process groups `members` are in. A shell leads its own session, and
-/// every process in a session was forked from one already in it, so each of
-/// these groups holds only processes under a shell. Groups 0 and 1 and
-/// `agy`'s own group are left out all the same.
-fn groups_of(members: &[Recorded], agy: u32) -> BTreeSet<u32> {
+/// The process groups `members` are in. Each member was found under a shell
+/// through parents not being debugged, and a shell leads its own session, in
+/// which every process was forked from one already in it, so each of these
+/// groups holds only processes started under a shell. Groups 0 and 1, `agy`'s
+/// group and Switchboard's own group (`own`) are left out all the same.
+fn groups_of(members: &[Recorded], agy: u32, own: u32) -> BTreeSet<u32> {
     members
         .iter()
         .map(|member| member.pgid)
-        .filter(|&group| group > 1 && group != agy)
+        .filter(|&group| group > 1 && group != agy && group != own)
         .collect()
 }
 
@@ -341,6 +382,8 @@ mod tests {
     );
 
     const AGY: u32 = 8970;
+    /// Switchboard's own process group.
+    const OWN: u32 = 8964;
 
     fn probe() -> Vec<Process> {
         parse_processes(PROBE).unwrap()
@@ -360,6 +403,7 @@ mod tests {
                 pgid: 9022,
                 session_leader: true,
                 has_terminal: true,
+                traced: false,
                 started: "Thu Nov 19 23:29:21 2026".to_owned(),
             })
         );
@@ -368,6 +412,22 @@ mod tests {
                 .map(|p| (p.session_leader, p.has_terminal)),
             Some((true, false))
         );
+    }
+
+    #[test]
+    fn only_a_pseudo_terminal_counts_as_a_terminal() {
+        let terminal = |tt: &str| {
+            parse_process(&format!(
+                " 9022  8970  9022 Ss+  {tt}  Thu Nov 19 23:29:21 2026"
+            ))
+            .map(|process| process.has_terminal)
+        };
+        assert_eq!(terminal("s001"), Some(true));
+        assert_eq!(terminal("s1024"), Some(true));
+        // Revoked, none, the console, and shapes `ps` has not been seen to write.
+        for tt in ["s001-", "??", "con", "s", "sx01", "001", "-"] {
+            assert_eq!(terminal(tt), Some(false), "{tt}");
+        }
     }
 
     #[test]
@@ -411,10 +471,52 @@ mod tests {
         let members = still_under(&reparented, &recorded);
         assert_eq!(pids(&members), vec![9022, 9024, 9030]);
         assert_eq!(
-            groups_of(&members, AGY),
+            groups_of(&members, AGY, OWN),
             BTreeSet::from([9022, 9030]),
             "a group a process under the shell made is ended too"
         );
+    }
+
+    #[test]
+    fn a_process_being_debugged_is_not_followed() {
+        // The command runs `lldb` (9030), whose `debugserver` (9031) has
+        // attached to a terminal shell outside `agy`'s tree (700, running
+        // 701), so `ps` lists that shell as the debugger's child.
+        let processes = parse_processes(concat!(
+            " 8970  8966  8970 S      ??  Thu Nov 19 23:29:12 2026\n",
+            " 9022  8970  9022 Ss+  s001  Thu Nov 19 23:29:21 2026\n",
+            " 9030  9022  9022 S+   s001  Thu Nov 19 23:29:22 2026\n",
+            " 9031  9030  9022 S+   s001  Thu Nov 19 23:29:22 2026\n",
+            "  700  9031   700 SXs+ s002  Thu Nov 19 08:00:01 2026\n",
+            "  701   700   701 S+   s002  Thu Nov 19 08:00:05 2026\n",
+        ))
+        .unwrap();
+        let shells = shells_under(&processes, AGY);
+        assert_eq!(
+            pids(&shells),
+            vec![9022],
+            "a debugged shell is no command shell"
+        );
+        let members = still_under(&processes, &shells);
+        assert_eq!(pids(&members), vec![9022, 9030, 9031]);
+        assert_eq!(groups_of(&members, AGY, OWN), BTreeSet::from([9022]));
+    }
+
+    #[test]
+    fn a_process_seen_under_a_shell_is_ended_after_the_shell_exits() {
+        let mut shells = CommandShells::new(uuid::Uuid::nil());
+        shells.note(&probe(), AGY);
+        // The shell's command finished while `agy` exited, leaving its
+        // `sleep` to launchd in the shell's group, with a child of its own.
+        let later = parse_processes(concat!(
+            " 9024     1  9022 S      ??  Thu Nov 19 23:29:21 2026\n",
+            " 9040  9024  9022 S      ??  Thu Nov 19 23:29:40 2026\n",
+        ))
+        .unwrap();
+        shells.note(&later, AGY);
+        let members = still_under(&later, &shells.recorded);
+        assert_eq!(pids(&members), vec![9024, 9040]);
+        assert_eq!(groups_of(&members, AGY, OWN), BTreeSet::from([9022]));
     }
 
     #[test]
@@ -426,13 +528,13 @@ mod tests {
     }
 
     #[test]
-    fn groups_0_1_and_agys_are_never_targets() {
-        let members = [8970, 0, 1, 9022].map(|pgid| Recorded {
+    fn groups_0_1_agys_and_switchboards_are_never_targets() {
+        let members = [AGY, OWN, 0, 1, 9022].map(|pgid| Recorded {
             pid: 9100 + pgid,
             started: "Thu Nov 19 23:29:21 2026".to_owned(),
             pgid,
         });
-        assert_eq!(groups_of(&members, AGY), BTreeSet::from([9022]));
+        assert_eq!(groups_of(&members, AGY, OWN), BTreeSet::from([9022]));
     }
 
     #[test]

@@ -579,10 +579,10 @@ async fn stop_process_tree(
     }
 }
 
-/// Kill a running `agy`'s group, recording the command shells under it from
-/// just before the SIGTERM until it exits, then end those shells. Ending them
-/// only once `agy` is gone keeps `agy` from seeing its command die and acting
-/// on it while it shuts down.
+/// Kill a running `agy`'s group, recording the command shells under it and
+/// the processes under them from just before the SIGTERM until it exits, then
+/// end those still running. Ending them only once `agy` is gone keeps `agy`
+/// from seeing its command die and acting on it while it shuts down.
 #[cfg(target_os = "macos")]
 async fn stop_running_agy(child: &mut tokio::process::Child, agy: u32, turn_id: TurnId) {
     let mut shells = command_shells::CommandShells::new(turn_id);

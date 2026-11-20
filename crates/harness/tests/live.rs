@@ -5380,16 +5380,21 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
     );
 }
 
-/// How long the background-command live tests' command sleeps: well past the
-/// 13 s they wait before stopping it.
+/// How long the background-command live tests' command sleeps: well past
+/// the wait they ask for, so `agy` moves the command to the background.
 const BACKGROUNDED_COMMAND_SECONDS: u64 = 25;
 
+/// The wait the background-command live tests ask the call for, within the
+/// 10,000 ms cap in `agy`'s `run_command` schema, so the command is moved to
+/// the background when that wait runs out.
+const BACKGROUNDED_COMMAND_WAIT_MS: u64 = 5000;
+
 /// A Stop must end a command `agy` has moved to the background (G52 in
-/// `docs/harness-behavior.md`). The command writes its shell's pid, sleeps,
-/// then touches a marker. The Stop comes 13 s after the command started, past
-/// the 10,000 ms cap on the call's wait, so `agy` has moved it to the
-/// background by then, whatever wait the model passed. Before the fix the
-/// shell outlived the Stop, reparented to launchd, and touched the marker.
+/// `docs/harness-behavior.md`). The command's shell writes its pid, and a
+/// child of the shell sleeps and then touches a marker, so a kill that
+/// reaches only the shell fails this too. The Stop comes once `agy` reports
+/// the command running as a background task. Before the fix the shell
+/// outlived the Stop, reparented to launchd, and the marker appeared.
 #[tokio::test]
 #[ignore = "requires antigravity installed — run with: make test-live"]
 #[serial_test::serial(antigravity)]
@@ -5398,8 +5403,8 @@ async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
     let (pid_file, marker) = (cwd.path().join("shell.pid"), cwd.path().join("marker"));
     let prompt = format!(
         "Use the run_command tool to run exactly this command, with WaitMsBeforeAsync set to \
-         60000: echo $$ > {}; sleep {BACKGROUNDED_COMMAND_SECONDS}; touch {}\nThen reply with \
-         the single word ack.",
+         {BACKGROUNDED_COMMAND_WAIT_MS}: echo $$ > {}; sh -c 'sleep \
+         {BACKGROUNDED_COMMAND_SECONDS}; touch {}'\nThen reply with the single word ack.",
         pid_file.display(),
         marker.display()
     );
@@ -5408,7 +5413,7 @@ async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
         cancel_token: token.clone(),
         ..Default::default()
     };
-    let stream = AntigravityAdapter::new()
+    let mut stream = AntigravityAdapter::new()
         .dispatch(
             &live_antigravity_agent(),
             cwd.path(),
@@ -5418,14 +5423,38 @@ async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
         )
         .await
         .expect("dispatch should succeed with real agy");
-    let collector = tokio::spawn(stream.collect::<Vec<AdapterEvent>>());
+    let (moved_tx, moved_rx) = tokio::sync::oneshot::channel();
+    let command = pid_file.display().to_string();
+    let collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut moved_tx = Some(moved_tx);
+        while let Some(event) = stream.next().await {
+            if let AdapterEvent::ToolCompleted { output, .. } = &event
+                && output.contains("running as a background task")
+                && output.contains(&command)
+                && let Some(moved) = moved_tx.take()
+            {
+                let _ = moved.send(());
+            }
+            events.push(event);
+        }
+        events
+    });
 
-    let Some((shell, started)) = live_shell_pid(&pid_file).await else {
+    let moved = tokio::time::timeout(std::time::Duration::from_mins(2), moved_rx).await;
+    if !matches!(moved, Ok(Ok(()))) {
         token.cancel();
         let events = collector.await.unwrap();
-        panic!("the agent never ran the command, so this run tested nothing; events: {events:?}");
+        panic!(
+            "agy never reported the command running as a background task, so this run tested \
+             nothing; events: {events:?}"
+        );
+    }
+    let Some((shell, found)) = live_shell_pid(&pid_file).await else {
+        token.cancel();
+        let events = collector.await.unwrap();
+        panic!("the command never wrote its shell's pid; events: {events:?}");
     };
-    tokio::time::sleep(std::time::Duration::from_secs(13)).await;
     let running_at_stop = nix::sys::signal::kill(shell, None).is_ok();
     token.cancel();
     let events = tokio::time::timeout(std::time::Duration::from_secs(30), collector)
@@ -5440,12 +5469,9 @@ async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    let finishes_at = started + std::time::Duration::from_secs(BACKGROUNDED_COMMAND_SECONDS + 3);
+    let finishes_at = found + std::time::Duration::from_secs(BACKGROUNDED_COMMAND_SECONDS + 3);
     tokio::time::sleep_until(finishes_at.into()).await;
     let finished = marker.exists();
-    if nix::sys::signal::kill(shell, None).is_ok() {
-        let _ = nix::sys::signal::killpg(shell, nix::sys::signal::Signal::SIGKILL);
-    }
 
     assert!(
         running_at_stop,
@@ -5468,12 +5494,14 @@ async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
 }
 
 /// The pid the live command's shell wrote to `pid_file`, and when it was
-/// found, or `None` if the agent never ran the command within two minutes.
+/// found, or `None` if it is not there within two minutes. A pid of 0 or 1
+/// counts as none: signalling either would reach far beyond the command.
 async fn live_shell_pid(pid_file: &Path) -> Option<(nix::unistd::Pid, std::time::Instant)> {
     for _ in 0..1200 {
         if let Some(pid) = std::fs::read_to_string(pid_file)
             .ok()
             .and_then(|text| text.trim().parse::<i32>().ok())
+            .filter(|&pid| pid > 1)
         {
             return Some((nix::unistd::Pid::from_raw(pid), std::time::Instant::now()));
         }

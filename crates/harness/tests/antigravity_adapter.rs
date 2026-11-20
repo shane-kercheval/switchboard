@@ -2309,54 +2309,57 @@ async fn a_forked_resume_heals_though_a_child_holds_stderr() {
 
 // --- commands agy runs on terminals of their own ----------------------------
 
-/// How long the fixture's command runs before it touches its marker.
+/// How long the fixture command's worker sleeps: long enough that the
+/// command cannot end on its own before a Stop's cleanup reaches it.
 #[cfg(target_os = "macos")]
-const COMMAND_SECONDS: u64 = 4;
+const COMMAND_SECONDS: u64 = 30;
 
+/// Where the fixture's command shell and its worker write their pids.
 #[cfg(target_os = "macos")]
-fn shell_pid_file(cwd: &Path) -> std::path::PathBuf {
-    cwd.join("shell.pid")
+struct CommandPids {
+    shell: std::path::PathBuf,
+    worker: std::path::PathBuf,
 }
 
 #[cfg(target_os = "macos")]
-fn command_marker(cwd: &Path) -> std::path::PathBuf {
-    cwd.join("command-finished")
+fn command_pids(cwd: &Path) -> CommandPids {
+    CommandPids {
+        shell: cwd.join("shell.pid"),
+        worker: cwd.join("worker.pid"),
+    }
 }
 
-/// A `command_shell` for the script: a shell that runs `sleep
-/// COMMAND_SECONDS; touch <marker>` as `agy` runs a command, leading its own
-/// session on a terminal of its own, outside `agy`'s process group.
+/// A `command_shell` for the script: a shell that runs a command as `agy`
+/// does, leading its own session on a terminal of its own, outside `agy`'s
+/// process group, with a worker in a process group of its own. With
+/// `after_term`, `fake_agy` holds SIGTERM and starts the shell once it
+/// arrives.
 #[cfg(target_os = "macos")]
-fn command_shell(cwd: &Path) -> Value {
+fn command_shell(cwd: &Path, after_term: bool) -> Value {
+    let pids = command_pids(cwd);
     json!({
         "seconds": COMMAND_SECONDS,
-        "pid_file": shell_pid_file(cwd).to_str().unwrap(),
-        "marker": command_marker(cwd).to_str().unwrap(),
+        "shell_pid_file": pids.shell.to_str().unwrap(),
+        "worker_pid_file": pids.worker.to_str().unwrap(),
+        "after_term": after_term,
     })
 }
 
-/// Whether the command's marker is still absent once the command would have
-/// finished, so an ended command is told apart from a slow one.
+/// Whether the command's shell and its worker are both gone within a few
+/// seconds.
 #[cfg(target_os = "macos")]
-async fn command_never_finishes(cwd: &Path) -> bool {
-    tokio::time::sleep(std::time::Duration::from_secs(COMMAND_SECONDS + 2)).await;
-    !command_marker(cwd).exists()
-}
-
-/// Kill the command shell's process group if the shell is still running: the
-/// test started it, through `fake_agy`.
-#[cfg(target_os = "macos")]
-fn end_command_shell(cwd: &Path) {
-    if let Some(shell) = read_pid(&shell_pid_file(cwd))
-        && nix::sys::signal::kill(shell, None).is_ok()
-    {
-        let _ = nix::sys::signal::killpg(shell, nix::sys::signal::Signal::SIGKILL);
-    }
+async fn command_ends(cwd: &Path) -> (bool, bool) {
+    let pids = command_pids(cwd);
+    wait_for_pid_file(&pids.shell).await;
+    (
+        leftover_ends(&pids.shell).await,
+        leftover_ends(&pids.worker).await,
+    )
 }
 
 /// Wait for `pid_file`, which `fake_agy` waits for before writing anything.
 async fn wait_for_pid_file(pid_file: &Path) {
-    for _ in 0..1000 {
+    for _ in 0..1500 {
         if pid_file.exists() {
             return;
         }
@@ -2386,7 +2389,8 @@ async fn stop_once(adapter: &AntigravityAdapter, cwd: &Path, ready: &Path) -> Ve
 
 /// `agy` runs each command as a shell leading its own session on a terminal
 /// of its own, outside the process group a Stop signals, and the shell
-/// outlives `agy`. A Stop must still end it, and the command with it.
+/// outlives `agy`. A Stop must still end it, and the process group a process
+/// under it made.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_stop_ends_a_command_agy_runs_on_its_own_terminal() {
@@ -2399,21 +2403,56 @@ async fn a_stop_ends_a_command_agy_runs_on_its_own_terminal() {
         &json!({
             "conversation_uuid": uuid.to_string(),
             "stream": [init_event(uuid)],
-            "command_shell": command_shell(cwd.path()),
+            "command_shell": command_shell(cwd.path(), false),
             "hang": true,
         }),
     );
 
-    let events = stop_once(&adapter, cwd.path(), &shell_pid_file(cwd.path())).await;
-    let shell_ended = leftover_ends(&shell_pid_file(cwd.path())).await;
-    let never_finished = command_never_finishes(cwd.path()).await;
-    end_command_shell(cwd.path());
+    let events = stop_once(&adapter, cwd.path(), &command_pids(cwd.path()).shell).await;
+    let (shell_ended, worker_ended) = command_ends(cwd.path()).await;
     assert!(
         !has_turn_end(&events),
         "a stopped turn ends with no terminal: {events:?}"
     );
     assert!(shell_ended, "the Stop ended the command's shell");
-    assert!(never_finished, "the command ran on after the Stop");
+    assert!(
+        worker_ended,
+        "the Stop ended the worker in a group of its own"
+    );
+}
+
+/// The adapter lists processes until `agy` exits, so a command `agy` starts
+/// after the Stop's SIGTERM is ended too.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_stop_ends_a_command_agy_starts_while_it_exits() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let ready = cwd.path().join("agy.pid");
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let uuid = Uuid::new_v4();
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "stream": [init_event(uuid)],
+            "pid_file_self": ready.to_str().unwrap(),
+            "command_shell": command_shell(cwd.path(), true),
+            "hang": true,
+        }),
+    );
+
+    let events = stop_once(&adapter, cwd.path(), &ready).await;
+    let (shell_ended, worker_ended) = command_ends(cwd.path()).await;
+    assert!(
+        !has_turn_end(&events),
+        "a stopped turn ends with no terminal: {events:?}"
+    );
+    assert!(
+        shell_ended,
+        "the Stop ended the shell agy started after SIGTERM"
+    );
+    assert!(worker_ended, "the Stop ended that shell's worker");
 }
 
 /// The auth fast-fail kills `agy` the way a Stop does, so it ends the
@@ -2429,7 +2468,7 @@ async fn an_auth_fast_fail_ends_a_command_agy_runs_on_its_own_terminal() {
         &json!({
             "conversation_uuid": Uuid::new_v4().to_string(),
             "create_brain_dir": false,
-            "command_shell": command_shell(cwd.path()),
+            "command_shell": command_shell(cwd.path(), false),
             "stderr": [drip("Authentication required. Please visit the URL to log in:", 0)],
             "hang": true,
         }),
@@ -2441,9 +2480,7 @@ async fn an_auth_fast_fail_ends_a_command_agy_runs_on_its_own_terminal() {
     )
     .await
     .expect("the auth line must force-kill agy");
-    let shell_ended = leftover_ends(&shell_pid_file(cwd.path())).await;
-    let never_finished = command_never_finishes(cwd.path()).await;
-    end_command_shell(cwd.path());
+    let (shell_ended, worker_ended) = command_ends(cwd.path()).await;
     assert!(
         matches!(
             outcome(&events),
@@ -2456,14 +2493,13 @@ async fn an_auth_fast_fail_ends_a_command_agy_runs_on_its_own_terminal() {
         outcome(&events)
     );
     assert!(shell_ended, "the fast-fail ended the command's shell");
-    assert!(never_finished, "the command ran on after the fast-fail");
+    assert!(worker_ended, "the fast-fail ended the command's worker");
 }
 
-/// What a Stop ends beyond `agy`'s process group is only the commands it runs
-/// on terminals of their own: a child `agy` started in a group of its own
-/// with no terminal, such as its auto-updater, keeps running.
+/// A child `agy` moved to a process group of its own, but not to a session
+/// of its own, is not a command shell: a Stop leaves it running.
 #[tokio::test]
-async fn a_stop_leaves_running_a_child_agy_started_outside_its_group_without_a_terminal() {
+async fn a_stop_leaves_running_a_child_agy_moved_to_a_group_of_its_own() {
     let home = tempfile::TempDir::new().unwrap();
     let cwd = tempfile::TempDir::new().unwrap();
     let pid_file = cwd.path().join("leftover.pid");
@@ -2486,5 +2522,46 @@ async fn a_stop_leaves_running_a_child_agy_started_outside_its_group_without_a_t
         !has_turn_end(&events),
         "a stopped turn ends with no terminal: {events:?}"
     );
-    assert!(alive, "the Stop left the child outside agy's group running");
+    assert!(
+        alive,
+        "the Stop left the child in a group of its own running"
+    );
+}
+
+/// `agy --bg-updater`, `agy`'s auto-updater, leads a session of its own with
+/// no terminal and is meant to outlive `agy`: a Stop leaves such a child
+/// running.
+#[tokio::test]
+async fn a_stop_leaves_running_a_session_leader_agy_started_without_a_terminal() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let pid_file = cwd.path().join("updater.pid");
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let uuid = Uuid::new_v4();
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "stream": [init_event(uuid)],
+            "leftover": {
+                "seconds": LEFTOVER_SECONDS,
+                "holds": "both",
+                "own_session": true,
+                "pid_file": pid_file.to_str().unwrap(),
+            },
+            "hang": true,
+        }),
+    );
+
+    let events = stop_once(&adapter, cwd.path(), &pid_file).await;
+    let alive = leftover_keeps_running(&pid_file).await;
+    end_leftover(&pid_file);
+    assert!(
+        !has_turn_end(&events),
+        "a stopped turn ends with no terminal: {events:?}"
+    );
+    assert!(
+        alive,
+        "the Stop left the session leader with no terminal running"
+    );
 }

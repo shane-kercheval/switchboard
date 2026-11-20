@@ -58,7 +58,12 @@
 //!     "own_group": false,            //   "both", "stdout" or "stderr"; own_group puts
 //!     "ignore_term": false,          //   it in a process group of its own; ignore_term
 //!     "pid_file": "<path>"           //   makes it ignore SIGTERM; its pid is written to
-//!   }                                //   pid_file once it is set up
+//!   },                               //   pid_file once it is set up
+//!   "command_shell": {               // optional (macOS): then start a shell that runs
+//!     "seconds": 5,                  //   `sleep <seconds>; touch <marker>` the way agy
+//!     "pid_file": "<path>",          //   runs a command: leading its own session on a
+//!     "marker": "<path>"             //   terminal of its own, ignoring SIGHUP. The shell
+//!   }                                //   writes its pid; this process waits for that
 //! }
 //! ```
 //!
@@ -148,6 +153,18 @@ struct Script {
     /// and keeps its output pipes open.
     #[serde(default)]
     leftover: Option<Leftover>,
+    /// A command shell to start once the leftover is running, before anything
+    /// is written.
+    #[serde(default)]
+    command_shell: Option<CommandShell>,
+}
+
+#[derive(Deserialize)]
+struct CommandShell {
+    seconds: u64,
+    pid_file: String,
+    /// Touched when the command finishes, so a test can tell it was not ended.
+    marker: String,
 }
 
 #[derive(Deserialize)]
@@ -210,6 +227,45 @@ fn start_leftover(leftover: &Leftover) {
     if !leftover.ignore_term {
         write_pid(&leftover.pid_file, child.id());
     }
+}
+
+/// Start `shell` the way `agy` starts a command, and return once the shell
+/// has written its pid.
+///
+/// `agy` runs each command as `zsh -c <command>` leading its own session on a
+/// terminal it opens, with SIGHUP ignored, so the shell outlives `agy`.
+/// `script` gives the shell that session and terminal without `unsafe`, which
+/// the workspace forbids; the shell is this process's grandchild, through
+/// `script`, which stays in this process's group.
+fn start_command_shell(shell: &CommandShell) {
+    let seconds = shell.seconds.to_string();
+    let spawned = std::process::Command::new("/usr/bin/script")
+        .args([
+            "-q",
+            "/dev/null",
+            "/bin/sh",
+            "-c",
+            r#"trap "" HUP; echo $$ > "$0.tmp" && mv "$0.tmp" "$0"; sleep "$1"; touch "$2""#,
+            shell.pid_file.as_str(),
+            seconds.as_str(),
+            shell.marker.as_str(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Err(e) = spawned {
+        eprintln!("fake_agy: cannot start the command shell: {e}");
+        std::process::exit(1);
+    }
+    for _ in 0..500 {
+        if std::path::Path::new(&shell.pid_file).exists() {
+            return;
+        }
+        sleep(Duration::from_millis(10));
+    }
+    eprintln!("fake_agy: the command shell never wrote its pid");
+    std::process::exit(1);
 }
 
 /// Write `pid` to `path` whole, so a reader polling for the file never sees
@@ -302,6 +358,9 @@ fn main() {
     }
     if let Some(leftover) = &script.leftover {
         start_leftover(leftover);
+    }
+    if let Some(shell) = &script.command_shell {
+        start_command_shell(shell);
     }
 
     stage_log(&args, &script);

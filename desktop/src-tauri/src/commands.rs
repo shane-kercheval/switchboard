@@ -18861,6 +18861,123 @@ mod tests {
         );
     }
 
+    /// Whether `pid` is running, asked through `/bin/kill -0`, which sends no
+    /// signal.
+    fn process_running(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Quitting Switchboard must end a command `agy` has moved to the
+    /// background (G52 in `docs/harness-behavior.md`). This runs
+    /// `drain_agents_then_release_locks`, the function quit runs, with a real
+    /// dispatcher and a real Antigravity agent; only the window and `app.exit`
+    /// around it are left out. The command writes its shell's pid, sleeps, then
+    /// touches a marker. The drain comes 13 s after the command started, past
+    /// the 10,000 ms cap on the call's wait, so `agy` has moved it to the
+    /// background by then. The shell must be gone when the drain returns,
+    /// since quit exits the app right after.
+    #[tokio::test]
+    #[ignore = "requires antigravity installed — run with: make test-live"]
+    #[serial_test::serial(antigravity)]
+    async fn live_antigravity_quit_ends_a_command_moved_to_the_background() {
+        const COMMAND_SECONDS: u64 = 25;
+        let tmp = TempDir::new().unwrap();
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new_for_test(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::new(switchboard_harness::AntigravityAdapter::new()),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        if let Some(map) = TEST_DIRECTORIES.lock().unwrap().as_mut() {
+            map.remove(state.store.root());
+        }
+        register_test_directory(&state, tmp.path().to_str().unwrap());
+        let project = create_project_in_only_dir(&state, "quit");
+        set_active_project_impl(&state, project.id).unwrap();
+        let agent = create_agent_impl(
+            &state,
+            "agy",
+            HarnessKind::Antigravity,
+            AgentSelection::default(),
+        )
+        .unwrap();
+        let (pid_file, marker) = (tmp.path().join("shell.pid"), tmp.path().join("marker"));
+        let prompt = format!(
+            "Use the run_command tool to run exactly this command, with WaitMsBeforeAsync set \
+             to 60000: echo $$ > {}; sleep {COMMAND_SECONDS}; touch {}\nThen reply with the \
+             single word ack.",
+            pid_file.display(),
+            marker.display()
+        );
+        send_msg(&state, agent.id, &prompt).await.unwrap();
+
+        let mut found = None;
+        for _ in 0..1200 {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                found = Some((pid, std::time::Instant::now()));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let Some((shell, started)) = found else {
+            drain_agents_then_release_locks(
+                &state,
+                &[agent.id],
+                &[project.id],
+                CancelSource::Shutdown,
+            )
+            .await;
+            panic!(
+                "the agent never ran the command, so this run tested nothing; events: {:?}",
+                emitter.snapshot()
+            );
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(13)).await;
+        let running_at_quit = process_running(shell);
+        drain_agents_then_release_locks(&state, &[agent.id], &[project.id], CancelSource::Shutdown)
+            .await;
+        // Only launchd reaping the shell may lag the drain.
+        let mut shell_ended = false;
+        for _ in 0..20 {
+            if !process_running(shell) {
+                shell_ended = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let finishes_at = started + std::time::Duration::from_secs(COMMAND_SECONDS + 3);
+        tokio::time::sleep_until(finishes_at.into()).await;
+        let finished = marker.exists();
+        if process_running(shell) {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-s", "KILL", "--", &format!("-{shell}")])
+                .status();
+        }
+
+        assert!(
+            running_at_quit,
+            "the command ended before quit's drain, so this run tested nothing"
+        );
+        assert!(
+            shell_ended,
+            "quit's drain returned with the command's shell still running (marker touched: \
+             {finished})"
+        );
+        assert!(
+            !finished,
+            "the command ran on after quit's drain and touched its marker"
+        );
+    }
+
     #[tokio::test]
     async fn send_message_writes_send_record_to_project_journal() {
         // End-to-end through the app sink: a completed turn writes one `send`

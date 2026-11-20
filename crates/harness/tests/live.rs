@@ -5380,6 +5380,108 @@ async fn live_antigravity_background_task_reopens_as_it_streamed() {
     );
 }
 
+/// How long the background-command live tests' command sleeps: well past the
+/// 13 s they wait before stopping it.
+const BACKGROUNDED_COMMAND_SECONDS: u64 = 25;
+
+/// A Stop must end a command `agy` has moved to the background (G52 in
+/// `docs/harness-behavior.md`). The command writes its shell's pid, sleeps,
+/// then touches a marker. The Stop comes 13 s after the command started, past
+/// the 10,000 ms cap on the call's wait, so `agy` has moved it to the
+/// background by then, whatever wait the model passed. Before the fix the
+/// shell outlived the Stop, reparented to launchd, and touched the marker.
+#[tokio::test]
+#[ignore = "requires antigravity installed — run with: make test-live"]
+#[serial_test::serial(antigravity)]
+async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
+    let cwd = tempfile::TempDir::new().unwrap();
+    let (pid_file, marker) = (cwd.path().join("shell.pid"), cwd.path().join("marker"));
+    let prompt = format!(
+        "Use the run_command tool to run exactly this command, with WaitMsBeforeAsync set to \
+         60000: echo $$ > {}; sleep {BACKGROUNDED_COMMAND_SECONDS}; touch {}\nThen reply with \
+         the single word ack.",
+        pid_file.display(),
+        marker.display()
+    );
+    let token = tokio_util::sync::CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let stream = AntigravityAdapter::new()
+        .dispatch(
+            &live_antigravity_agent(),
+            cwd.path(),
+            &prompt,
+            Uuid::now_v7(),
+            options,
+        )
+        .await
+        .expect("dispatch should succeed with real agy");
+    let collector = tokio::spawn(stream.collect::<Vec<AdapterEvent>>());
+
+    let Some((shell, started)) = live_shell_pid(&pid_file).await else {
+        token.cancel();
+        let events = collector.await.unwrap();
+        panic!("the agent never ran the command, so this run tested nothing; events: {events:?}");
+    };
+    tokio::time::sleep(std::time::Duration::from_secs(13)).await;
+    let running_at_stop = nix::sys::signal::kill(shell, None).is_ok();
+    token.cancel();
+    let events = tokio::time::timeout(std::time::Duration::from_secs(30), collector)
+        .await
+        .expect("the stopped turn ended within 30 s")
+        .unwrap();
+    let mut shell_ended = false;
+    for _ in 0..300 {
+        if nix::sys::signal::kill(shell, None).is_err() {
+            shell_ended = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let finishes_at = started + std::time::Duration::from_secs(BACKGROUNDED_COMMAND_SECONDS + 3);
+    tokio::time::sleep_until(finishes_at.into()).await;
+    let finished = marker.exists();
+    if nix::sys::signal::kill(shell, None).is_ok() {
+        let _ = nix::sys::signal::killpg(shell, nix::sys::signal::Signal::SIGKILL);
+    }
+
+    assert!(
+        running_at_stop,
+        "the command ended before the Stop, so this run tested nothing; events: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AdapterEvent::TurnEnd { .. })),
+        "a stopped turn ends with no terminal; events: {events:?}"
+    );
+    assert!(
+        shell_ended,
+        "the command's shell outlived the Stop (marker touched: {finished})"
+    );
+    assert!(
+        !finished,
+        "the command ran on after the Stop and touched its marker"
+    );
+}
+
+/// The pid the live command's shell wrote to `pid_file`, and when it was
+/// found, or `None` if the agent never ran the command within two minutes.
+async fn live_shell_pid(pid_file: &Path) -> Option<(nix::unistd::Pid, std::time::Instant)> {
+    for _ in 0..1200 {
+        if let Some(pid) = std::fs::read_to_string(pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        {
+            return Some((nix::unistd::Pid::from_raw(pid), std::time::Instant::now()));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    None
+}
+
 /// Lowercased words with punctuation trimmed, so `Ack.` reads as `ack`.
 fn words(text: &str) -> Vec<String> {
     text.split_whitespace()

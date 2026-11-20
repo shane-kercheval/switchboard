@@ -8,10 +8,10 @@
   /// loader is 1.2px off center at a 14px render.
   ///
   /// `stillWhenReducedMotion` is for a spinner that marks a *state* rather than
-  /// a wait (an agent at work): under `prefers-reduced-motion` it stops and
-  /// draws a full circle. It takes its color from `currentColor`, so the caller
-  /// sets a `text-*` color instead of border colors. Plain loaders keep
-  /// spinning: a still ring beside no text reads as a stuck loader.
+  /// something loading (an agent at work): under `prefers-reduced-motion` it
+  /// stops and draws a full circle. It takes its color from `currentColor`, so
+  /// the caller sets a `text-*` color instead of border colors. Plain loaders
+  /// keep spinning: a still ring beside no text reads as a stuck loader.
   import { cn } from "$lib/utils";
 
   let {

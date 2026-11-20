@@ -46,13 +46,7 @@
   import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
-  import {
-    EFFORT_OPTIONS,
-    effortSupportFor,
-    modelLabel,
-    selectionChanges,
-    selectionIsValid,
-  } from "$lib/agentSelection";
+  import { effortSupportFor, selectionChanges, selectionIsValid } from "$lib/agentSelection";
   import { preferences } from "$lib/preferences.svelte";
   import {
     AGENTS_SIDEBAR_DEFAULT_WIDTH,
@@ -135,19 +129,6 @@
       rt.run_status === "processing" ||
       (rt.pending_sends ?? []).length > 0
     );
-  }
-
-  /// The agent's next-send model and effort in words, for the status line that
-  /// covers the selection chips while the agent is busy.
-  function selectionSummary(agent: AgentRecord): string {
-    const model =
-      agent.model === null ? "Harness/session default" : modelLabel(agent.harness, agent.model);
-    const effort =
-      agent.effort === null
-        ? "Harness/session default"
-        : (EFFORT_OPTIONS[agent.harness].find((option) => option.value === agent.effort)?.label ??
-          agent.effort);
-    return `Model: ${model} · Effort: ${effort}`;
   }
 
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
@@ -1090,40 +1071,26 @@
   </div>
 {/snippet}
 
-<!-- The card's second line while the agent is not idle. Its detail (the
-     model and effort it covers, every agent waited on, a failure's reason)
-     rides a hover tooltip rather than a Tab stop; the same words sit in
-     visually hidden text, and the card's own label names the state. No live
-     region: nothing here is announced as it changes. -->
-{#snippet statusLine(
-  agent: AgentRecord,
-  activity: Exclude<AgentActivity, { kind: "idle" }>,
-  placement: string,
-)}
+<!-- The card's status row while the agent is not idle. Its detail (every
+     agent waited on, a failure's reason) rides a hover tooltip rather than a
+     Tab stop; the same words sit in visually hidden text, and the card's own
+     label names the state. No live region: nothing here is announced as it
+     changes. -->
+{#snippet statusLine(activity: Exclude<AgentActivity, { kind: "idle" }>)}
   {#if activity.kind === "working"}
-    <Tooltip
-      label={selectionSummary(agent)}
-      delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
-      focusable={false}
+    <div
+      class="mt-1.5 flex min-w-0 items-center gap-1.5 text-xs"
+      data-testid="agent-status"
+      data-status="working"
     >
-      {#snippet trigger(props)}
-        <div
-          {...props}
-          class={cn("flex min-w-0 items-center gap-1.5 text-xs", placement)}
-          data-testid="agent-status"
-          data-status="working"
-        >
-          <span class="text-status-processing font-medium">Working</span>
-          <LoadingDots class="text-status-processing" />
-          {#if activity.startedAt !== undefined}
-            <span class="text-muted tabular-nums" data-testid="agent-status-elapsed">
-              {formatDuration(now() - Date.parse(activity.startedAt))}
-            </span>
-          {/if}
-          <span class="sr-only">{selectionSummary(agent)}</span>
-        </div>
-      {/snippet}
-    </Tooltip>
+      <span class="text-status-processing font-medium">Working</span>
+      <LoadingDots class="text-status-processing" />
+      {#if activity.startedAt !== undefined}
+        <span class="text-muted tabular-nums" data-testid="agent-status-elapsed">
+          {formatDuration(now() - Date.parse(activity.startedAt))}
+        </span>
+      {/if}
+    </div>
   {:else if activity.kind === "waiting"}
     <!-- Names every target in full: the line counts all but the first, and
          truncates a long first name at narrow widths. -->
@@ -1133,7 +1100,7 @@
       focusable={false}
     >
       {#snippet trigger(props)}
-        {@render waitingLine(activity.on, placement, props)}
+        {@render waitingLine(activity.on, props)}
       {/snippet}
     </Tooltip>
   {:else}
@@ -1141,7 +1108,7 @@
       {#snippet trigger(props)}
         <div
           {...props}
-          class={cn("flex min-w-0 items-center text-xs", placement)}
+          class="mt-1.5 flex min-w-0 items-center text-xs"
           data-testid="agent-status"
           data-status="failed"
         >
@@ -1157,11 +1124,11 @@
 {/snippet}
 
 <!-- One target is named; the rest are counted, and listed by the tooltip. -->
-{#snippet waitingLine(on: WaitTarget[], placement: string, props: Record<string, unknown>)}
+{#snippet waitingLine(on: WaitTarget[], props: Record<string, unknown>)}
   {@const first = on[0]}
   <div
     {...props}
-    class={cn("text-muted flex min-w-0 items-center gap-1 text-xs", placement)}
+    class="text-muted mt-1.5 flex min-w-0 items-center gap-1 text-xs"
     data-testid="agent-status"
     data-status="waiting"
   >
@@ -1767,7 +1734,12 @@
                     {/if}
                   {/if}
                 </DropdownMenu>
-                <ActivityRing active={activity.kind === "working"} class="ml-0.5">
+                <ActivityRing
+                  state={activity.kind === "working" || activity.kind === "waiting"
+                    ? activity.kind
+                    : "idle"}
+                  class="ml-0.5"
+                >
                   <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
                 </ActivityRing>
                 {#if agents.length > 1}
@@ -1862,56 +1834,42 @@
           <!-- Selected model/effort is future-send intent, never observed
                  runtime history. The transcript footer owns the actual model
                  used by each completed turn. -->
-          <!-- While the card shows a status (working, waiting, or failed), the
-               status line is drawn over the selection chips, which stay laid
-               out but hidden and inert, so the card keeps its height. -->
           {#if canConfigureSelection(agent)}
-            <div class="relative mt-1.5">
-              <div
-                class={cn(
-                  "flex min-w-0 flex-wrap items-center gap-1",
-                  activity.kind !== "idle" && "invisible",
-                )}
-                data-testid="agent-selection"
-                inert={activity.kind !== "idle"}
-              >
-                {#if emptySelection}
-                  <span class="text-muted text-xs" data-testid="agent-selection-default">
-                    Harness/session default
-                  </span>
-                {:else if agent.model_choices.length > 0}
-                  <AgentSelectionChip
-                    axis="model"
-                    harness={agent.harness}
-                    selection={agentSelection}
-                    busy={selectionBusy(agent.id)}
-                    onActivate={(selection) => void activateSelection(agent, selection)}
-                  />
-                {:else if agent.model === null && SUPPORTS_MODEL_SELECTION[agent.harness]}
-                  <span class="text-muted text-xs" data-testid="agent-model-default">
-                    Model: Harness/session default
-                  </span>
-                {/if}
-                {#if agent.effort_choices.length > 0 && effortSupport.kind !== "none"}
-                  <AgentSelectionChip
-                    axis="effort"
-                    harness={agent.harness}
-                    selection={agentSelection}
-                    busy={selectionBusy(agent.id)}
-                    onActivate={(selection) => void activateSelection(agent, selection)}
-                  />
-                {:else if !emptySelection && agent.effort === null && effortSupport.kind !== "none" && SUPPORTS_EFFORT_SELECTION[agent.harness]}
-                  <span class="text-muted text-xs" data-testid="agent-effort-default">
-                    Effort: Harness/session default
-                  </span>
-                {/if}
-              </div>
-              {#if activity.kind !== "idle"}
-                {@render statusLine(agent, activity, "absolute inset-0")}
+            <div
+              class="mt-1.5 flex min-w-0 flex-wrap items-center gap-1"
+              data-testid="agent-selection"
+            >
+              {#if emptySelection}
+                <span class="text-muted text-xs" data-testid="agent-selection-default">
+                  Harness/session default
+                </span>
+              {:else if agent.model_choices.length > 0}
+                <AgentSelectionChip
+                  axis="model"
+                  harness={agent.harness}
+                  selection={agentSelection}
+                  busy={selectionBusy(agent.id)}
+                  onActivate={(selection) => void activateSelection(agent, selection)}
+                />
+              {:else if agent.model === null && SUPPORTS_MODEL_SELECTION[agent.harness]}
+                <span class="text-muted text-xs" data-testid="agent-model-default">
+                  Model: Harness/session default
+                </span>
+              {/if}
+              {#if agent.effort_choices.length > 0 && effortSupport.kind !== "none"}
+                <AgentSelectionChip
+                  axis="effort"
+                  harness={agent.harness}
+                  selection={agentSelection}
+                  busy={selectionBusy(agent.id)}
+                  onActivate={(selection) => void activateSelection(agent, selection)}
+                />
+              {:else if !emptySelection && agent.effort === null && effortSupport.kind !== "none" && SUPPORTS_EFFORT_SELECTION[agent.harness]}
+                <span class="text-muted text-xs" data-testid="agent-effort-default">
+                  Effort: Harness/session default
+                </span>
               {/if}
             </div>
-          {:else if activity.kind !== "idle"}
-            {@render statusLine(agent, activity, "mt-1.5")}
           {/if}
           {#if selectionSaveErrors[agent.id]}
             <p class="text-status-failed mt-1 text-xs" data-testid="agent-selection-save-error">
@@ -2036,6 +1994,11 @@
                 {/if}
               {/if}
             </div>
+          {/if}
+          <!-- Below the context bar, or in its place when there is none, and
+               above the expanded details so expanding never moves it. -->
+          {#if activity.kind !== "idle"}
+            {@render statusLine(activity)}
           {/if}
           {#if !isCollapsed}
             <!-- Per-turn cost is deliberately NOT shown on the card — it

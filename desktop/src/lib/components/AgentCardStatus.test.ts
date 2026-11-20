@@ -150,8 +150,9 @@ describe("an agent card's status", () => {
       "docs-writer, collapsed. Press Enter or Space to toggle details.",
     );
     expect(within(idle).queryByTestId("activity-ring")).toBeNull();
+    expect(within(idle).queryByTestId("waiting-ring")).toBeNull();
     expect(within(idle).queryByTestId("agent-status")).toBeNull();
-    expect(within(idle).getByTestId("agent-selection")).not.toHaveAttribute("inert");
+    expect(within(idle).getByTestId("agent-selection")).toHaveTextContent("Opus");
   });
 
   it("works from the send, through the turn, to a failure, and clears it when the next turn starts", async () => {
@@ -179,6 +180,7 @@ describe("an agent card's status", () => {
     expect(failed).toHaveAttribute("data-activity", "failed");
     expect(failed.getAttribute("aria-label")).toContain("docs-writer, last turn failed,");
     expect(within(failed).queryByTestId("activity-ring")).toBeNull();
+    expect(within(failed).queryByTestId("waiting-ring")).toBeNull();
     const status = within(failed).getByTestId("agent-status");
     expect(status).toHaveTextContent("Last turn failed");
     expect(await hoverTooltip(status)).toContain("claude exited with code 1");
@@ -329,23 +331,135 @@ describe("an agent card's status", () => {
     expect(elapsed).toHaveTextContent("1m 15s");
   });
 
-  it("covers the model chips while working, out of the tab order, and names them on hover", async () => {
+  it("keeps the model and effort chips in reach while working, with no tooltip on the status", async () => {
     await openProject();
     await send(DOCS, 1);
     await tick();
     const working = card(DOCS);
     const chips = within(working).getByTestId("agent-selection");
-    // jsdom has no `inert`, so Svelte's property write leaves no attribute here;
-    // the browser suite checks the real attribute.
-    expect((chips as HTMLElement & { inert?: boolean }).inert).toBe(true);
-    expect(chips).toHaveClass("invisible");
+    expect(chips).not.toHaveClass("invisible");
+    expect(chips).toHaveTextContent("Opus");
+    expect(chips).toHaveTextContent("High");
     const status = within(working).getByTestId("agent-status");
     expect(status).toHaveTextContent("Working");
-    expect(await hoverTooltip(status)).toBe("Model: Opus · Effort: High");
+    // The chips name the model and effort, so the status line has no tooltip.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await fireEvent.pointerEnter(status);
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(screen.queryByTestId("tooltip-content")).toBeNull();
+    vi.useRealTimers();
     // The accessible name carries the state, not the ticking time.
     expect(working.getAttribute("aria-label")).toBe(
       "docs-writer, working, collapsed. Press Enter or Space to toggle details.",
     );
+  });
+
+  it("puts the status row after the chips and the context bar in every state, and adds no row while idle", async () => {
+    await openProject();
+    const state = await agentState();
+    state.transcripts[DOCS.id] = [
+      {
+        role: "agent",
+        turn_id: "t0",
+        agent_id: DOCS.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          context_input_tokens: 100_000,
+          context_tokens_after_turn: 100_000,
+          context_window: 1_000_000,
+        },
+      },
+    ];
+    await tick();
+    const follows = (later: HTMLElement, earlier: HTMLElement): boolean =>
+      (earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    const expectStatusBelow = (): void => {
+      const current = card(DOCS);
+      const chips = within(current).getByTestId("agent-selection");
+      const bar = within(current).getByTestId("agent-context-bar");
+      const status = within(current).getByTestId("agent-status");
+      expect(follows(bar, chips)).toBe(true);
+      expect(follows(status, bar)).toBe(true);
+      expect(chips).not.toHaveClass("invisible");
+    };
+    expect(within(card(DOCS)).queryByTestId("agent-status")).toBeNull();
+
+    await send(DOCS, 1);
+    await tick();
+    expect(card(DOCS)).toHaveAttribute("data-activity", "working");
+    expectStatusBelow();
+
+    fireTo(`agent:${DOCS.id}`, turnStart(1));
+    fireTo(`agent:${DOCS.id}`, {
+      type: "turn_end",
+      turn_id: "turn-1",
+      outcome: { status: "failed", kind: "harness_error", message: "boom" },
+      ended_at: "2026-05-16T00:00:05Z",
+    });
+    fireTo(`agent:${DOCS.id}`, { type: "agent_idle", agent_id: DOCS.id });
+    await tick();
+    expect(card(DOCS)).toHaveAttribute("data-activity", "failed");
+    expectStatusBelow();
+
+    (await import("$lib/state/heldForwards.svelte")).addHeldForward(PROJECT_ID, {
+      forwardId: "f1",
+      sendId: "send-f",
+      body: "",
+      sources: [{ id: IMPL.id, name: IMPL.name }],
+      recipients: [DOCS.id],
+    });
+    await tick();
+    expect(card(DOCS)).toHaveAttribute("data-activity", "waiting");
+    expectStatusBelow();
+  });
+
+  it("puts the status row where the context bar would be when there is none", async () => {
+    await openProject();
+    await send(DOCS, 1);
+    await tick();
+    const working = card(DOCS);
+    expect(within(working).queryByTestId("agent-context-bar")).toBeNull();
+    const chips = within(working).getByTestId("agent-selection");
+    const status = within(working).getByTestId("agent-status");
+    expect(chips.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("adds the expanded details only below the status row, so expanding does not move it", async () => {
+    await openProject();
+    await send(DOCS, 1);
+    const state = await agentState();
+    state.runtimes[DOCS.id] = {
+      ...state.runtimes[DOCS.id]!,
+      meta: {
+        model: "claude-opus",
+        harness_version: "2.1.274",
+        inventory: { skills: [{ name: "debug" }] },
+      },
+    };
+    await tick();
+    /// Every rendered element of the card that comes before its status row.
+    const before = (): string[] => {
+      const current = card(DOCS);
+      const status = within(current).getByTestId("agent-status");
+      return [...current.querySelectorAll<HTMLElement>("*")]
+        .filter(
+          (el) => (el.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+        )
+        .filter((el) => !el.contains(status))
+        .map((el) => el.dataset.testid ?? el.tagName);
+    };
+    const collapsedCount = card(DOCS).querySelectorAll("*").length;
+    const collapsed = before();
+    await fireEvent.click(within(card(DOCS)).getByTestId("agent-status"));
+    expect(card(DOCS)).toHaveAttribute("data-collapsed", "false");
+    expect(card(DOCS).querySelectorAll("*").length).toBeGreaterThan(collapsedCount);
+    expect(within(card(DOCS)).getByTestId("agent-meta")).toBeInTheDocument();
+    expect(before()).toEqual(collapsed);
   });
 
   it("waits on a held forward's sources until the forward is released", async () => {
@@ -365,6 +479,7 @@ describe("an agent card's status", () => {
     const waiting = card(DOCS);
     expect(waiting).toHaveAttribute("data-activity", "waiting");
     expect(within(waiting).queryByTestId("activity-ring")).toBeNull();
+    expect(within(waiting).getByTestId("waiting-ring")).toBeInTheDocument();
     const status = within(waiting).getByTestId("agent-status");
     expect(within(status).getByTestId("agent-status-wait-chip")).toHaveTextContent("implementer");
     expect(within(status).getByTestId("agent-status-wait-more")).toHaveTextContent("+1");
@@ -374,6 +489,7 @@ describe("an agent card's status", () => {
     held.removeHeldForward(PROJECT_ID, "f1");
     await tick();
     expect(card(DOCS)).toHaveAttribute("data-activity", "idle");
+    expect(within(card(DOCS)).queryByTestId("waiting-ring")).toBeNull();
   });
 
   it("names a single waiting target in full on hover", async () => {

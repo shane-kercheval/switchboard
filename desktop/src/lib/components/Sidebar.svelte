@@ -108,7 +108,6 @@
   import {
     activityPhrase,
     agentActivity,
-    waitTargetName,
     type AgentActivity,
     type WaitTarget,
   } from "$lib/state/agentActivity.svelte";
@@ -1126,19 +1125,17 @@
       {/snippet}
     </Tooltip>
   {:else if activity.kind === "waiting"}
-    {#if activity.on.length > 1}
-      <Tooltip
-        label={`Waiting for ${activity.on.map(waitTargetName).join(", ")}`}
-        delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
-        focusable={false}
-      >
-        {#snippet trigger(props)}
-          {@render waitingLine(activity.on, placement, props)}
-        {/snippet}
-      </Tooltip>
-    {:else}
-      {@render waitingLine(activity.on, placement, {})}
-    {/if}
+    <!-- Names every target in full: the line counts all but the first, and
+         truncates a long first name at narrow widths. -->
+    <Tooltip
+      label={`Waiting for ${activity.on.map((target) => target.name).join(", ")}`}
+      delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+      focusable={false}
+    >
+      {#snippet trigger(props)}
+        {@render waitingLine(activity.on, placement, props)}
+      {/snippet}
+    </Tooltip>
   {:else}
     <Tooltip delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
       {#snippet trigger(props)}
@@ -1172,7 +1169,12 @@
     {#if first !== undefined}{@render waitTarget(first)}{/if}
     {#if on.length > 1}
       <span class="shrink-0" data-testid="agent-status-wait-more">+{on.length - 1}</span>
-      <span class="sr-only">{on.slice(1).map(waitTargetName).join(", ")}</span>
+      <span class="sr-only"
+        >{on
+          .slice(1)
+          .map((target) => target.name)
+          .join(", ")}</span
+      >
     {/if}
   </div>
 {/snippet}
@@ -1190,7 +1192,7 @@
       <span class="truncate">{target.name}</span>
     </span>
   {:else}
-    <span class="text-fg min-w-0 truncate">{waitTargetName(target)}</span>
+    <span class="text-fg min-w-0 truncate">{target.name}</span>
   {/if}
 {/snippet}
 

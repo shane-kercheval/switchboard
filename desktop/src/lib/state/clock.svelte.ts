@@ -1,6 +1,6 @@
 import { createSubscriber } from "svelte/reactivity";
 
-/// A wall clock shared by every live elapsed-time label. One `setInterval`
+/// A wall clock shared by the agent cards' elapsed times. One `setInterval`
 /// runs while at least one effect or template reads `now()`, and stops when
 /// the last reader goes away, so idle screens hold no timer.
 const TICK_MS = 1000;

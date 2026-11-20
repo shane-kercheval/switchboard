@@ -283,7 +283,7 @@ export type ContextReportRequest = {
 ///   as a failed agent turn. No surface reads a failure's *kind* — the usage
 ///   store, once the lone consumer of `usage_limit`, now asks the harness for
 ///   its account quota state on every turn end regardless of outcome. Does NOT
-///   gate Send. Cleared by the next send to an idle agent, or when a turn starts.
+///   gate Send. Cleared when the next turn starts.
 /// - `in_flight_turn_id`: heartbeat scope. The turn the timer is tracking.
 ///
 /// Conflating these (e.g., a status enum with `"errored"`) would force the
@@ -362,6 +362,10 @@ export type AgentRuntime = {
   /// IPC reply lands; this tracking key lets late events still extend the
   /// timer correctly.
   in_flight_turn_id?: TurnId;
+  /// When the running turn started (its `turn_start`), for the card's elapsed
+  /// time. Cleared at `turn_end`, so it is absent while a send is only queued
+  /// and between a turn's end and the agent going idle.
+  turn_started_at?: string;
   /// Transient: the ISO-8601 instant the heartbeat timer expired while this turn
   /// was still in flight with no activity (i.e. when the turn went "quiet").
   /// The turn is alive on the backend (it still holds the busy-lock) but silent,
@@ -383,9 +387,10 @@ export type AgentRuntime = {
   open_tasks?: OpenTask[];
   /// Runtime record of the last turn's failure, shown on the agent card as "Last
   /// turn failed" (`agentActivity.svelte.ts`). Set on failed `TurnEnd` or a
-  /// pre-start `message_failed`; cleared by the next send to an idle agent, or
-  /// when a turn starts. Does NOT gate sendability. (A heartbeat timeout no longer sets this — a silent turn
-  /// isn't a failure; see `quiet_since`.)
+  /// pre-start `message_failed`; cleared when the next turn starts. A context
+  /// report neither sets nor clears it: its outcome lives on
+  /// `context_report_request`. Does NOT gate sendability. A heartbeat timeout
+  /// does not set it: a silent turn isn't a failure (see `quiet_since`).
   last_error?: { message: string; kind: FailureKind };
   /// Populated by live `SessionMeta` events or by disk hydration of the
   /// agent's session file. Undefined on agents whose first dispatch

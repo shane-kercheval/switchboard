@@ -9,7 +9,7 @@ import {
   type ActivityInputs,
   type AgentActivity,
 } from "./agentActivity.svelte";
-import type { AgentRuntime, Turn } from "./types";
+import type { AgentRuntime } from "./types";
 import type { HeldForward } from "./heldForwards.svelte";
 import type { AgentRecord, WorkflowRunInfo, WorkflowStepInfo } from "$lib/types";
 
@@ -38,17 +38,6 @@ const ROSTER = [IMPL, REVIEW, DOCS];
 
 function runtime(id: string, patch: Partial<AgentRuntime> = {}): AgentRuntime {
   return { agent_id: id, run_status: "idle", hydration_status: "complete", ...patch };
-}
-
-function streamingTurn(id: string, agentId: string, startedAt: string): Turn {
-  return {
-    role: "agent",
-    turn_id: id,
-    agent_id: agentId,
-    started_at: startedAt,
-    status: "streaming",
-    items: [],
-  };
 }
 
 function step(kind: WorkflowStepInfo["kind"], names: string[]): WorkflowStepInfo {
@@ -91,7 +80,6 @@ function derive(target: AgentRecord, patch: Partial<ActivityInputs> = {}): Agent
     projectId: PROJECT,
     roster: ROSTER,
     runtimes: Object.fromEntries(ROSTER.map((a) => [a.id, runtime(a.id)])),
-    transcript: [],
     heldForwards: [],
     runs: [],
     findAgent: () => undefined,
@@ -104,12 +92,14 @@ describe("deriveAgentActivity", () => {
     expect(derive(DOCS)).toEqual({ kind: "idle" });
   });
 
-  it("reads working with the streaming turn's start while a turn runs", () => {
+  it("reads working with the running turn's start", () => {
     const activity = derive(IMPL, {
       runtimes: {
-        [IMPL.id]: runtime(IMPL.id, { run_status: "processing", in_flight_turn_id: "t1" }),
+        [IMPL.id]: runtime(IMPL.id, {
+          run_status: "processing",
+          turn_started_at: "2026-05-16T00:00:10Z",
+        }),
       },
-      transcript: [streamingTurn("t1", IMPL.id, "2026-05-16T00:00:10Z")],
     });
     expect(activity).toEqual({ kind: "working", startedAt: "2026-05-16T00:00:10Z" });
   });
@@ -188,6 +178,46 @@ describe("deriveAgentActivity", () => {
       });
     });
 
+    it("names only the sources still running, while any is", () => {
+      const activity = derive(DOCS, {
+        runtimes: {
+          [IMPL.id]: runtime(IMPL.id),
+          [REVIEW.id]: runtime(REVIEW.id, { run_status: "processing" }),
+        },
+        heldForwards: [
+          held(
+            [
+              { id: IMPL.id, name: IMPL.name },
+              { id: REVIEW.id, name: REVIEW.name },
+            ],
+            [DOCS.id],
+          ),
+        ],
+      });
+      expect(activity).toEqual({
+        kind: "waiting",
+        on: [{ kind: "agent", agentId: REVIEW.id, name: "reviewer", harness: "codex" }],
+      });
+    });
+
+    it("keeps a source whose state this window doesn't hold, and drops an idle one", () => {
+      const unopened = { id: "00000000-0000-7000-8000-000000000009", name: "planner" };
+      const activity = derive(DOCS, {
+        runtimes: { [IMPL.id]: runtime(IMPL.id) },
+        heldForwards: [held([{ id: IMPL.id, name: IMPL.name }, unopened], [DOCS.id])],
+      });
+      expect(activity.kind === "waiting" && activity.on.map((t) => t.name)).toEqual(["planner"]);
+    });
+
+    it("names every source when all have gone idle but the forward is still held", () => {
+      const activity = derive(DOCS, {
+        heldForwards: [held([{ id: IMPL.id, name: IMPL.name }], [DOCS.id])],
+      });
+      expect(activity.kind === "waiting" && activity.on.map((t) => t.name)).toEqual([
+        "implementer",
+      ]);
+    });
+
     it("ignores a forward held for another agent", () => {
       const activity = derive(DOCS, {
         heldForwards: [held([{ id: IMPL.id, name: IMPL.name }], [REVIEW.id])],
@@ -227,6 +257,23 @@ describe("deriveAgentActivity", () => {
       });
     });
 
+    it("waits only on the agents of the current step, not every working agent of the run", () => {
+      const fanOut = [
+        step("send", ["implementer", "reviewer"]),
+        step("wait", ["reviewer"]),
+        step("send", ["docs-writer"]),
+      ];
+      const bothWorking = {
+        [IMPL.id]: runtime(IMPL.id, { run_status: "processing" }),
+        [REVIEW.id]: runtime(REVIEW.id, { run_status: "processing" }),
+        [DOCS.id]: runtime(DOCS.id),
+      };
+      expect(derive(DOCS, { runs: [run(1, fanOut)], runtimes: bothWorking })).toEqual({
+        kind: "waiting",
+        on: [{ kind: "agent", agentId: REVIEW.id, name: "reviewer", harness: "codex" }],
+      });
+    });
+
     it("matches step names the way the backend compares names", () => {
       const renamed = [step("send", ["implementer"]), step("send", ["REVIEWER"])];
       expect(derive(REVIEW, { runs: [run(0, renamed)], runtimes: implWorking }).kind).toBe(
@@ -241,14 +288,6 @@ describe("deriveAgentActivity", () => {
     it("is not waiting for a run that is not running", () => {
       const failedRun = run(1, steps, { status: "failed" });
       expect(derive(REVIEW, { runs: [failedRun], runtimes: implWorking }).kind).toBe("idle");
-    });
-
-    it("waits on the user when the run is paused for input", () => {
-      const paused = [step("send", ["implementer"]), step("pause", []), step("send", ["reviewer"])];
-      expect(derive(REVIEW, { runs: [run(1, paused)] })).toEqual({
-        kind: "waiting",
-        on: [{ kind: "user" }],
-      });
     });
 
     it("waits on the run by name when none of its agents is working", () => {
@@ -279,9 +318,12 @@ describe("activityPhrase", () => {
     expect(
       activityPhrase({
         kind: "waiting",
-        on: [{ kind: "agent", agentId: IMPL.id, name: "implementer" }, { kind: "user" }],
+        on: [
+          { kind: "agent", agentId: IMPL.id, name: "implementer" },
+          { kind: "workflow", name: "review-loop" },
+        ],
       }),
-    ).toBe("waiting for implementer, you");
+    ).toBe("waiting for implementer, review-loop");
     expect(activityPhrase({ kind: "failed", reason: "boom" })).toBe("last turn failed");
     expect(activityPhrase({ kind: "idle" })).toBeNull();
   });

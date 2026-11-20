@@ -5,11 +5,11 @@
 /// Precedence when several apply: **working > waiting > failed > idle**.
 /// Working is what the agent is doing now (a held forward to a busy agent will
 /// itself queue behind that turn). Waiting outranks failed because a send is
-/// already on its way, and its dispatch clears the failure.
+/// already on its way, and its turn's start clears the failure.
 
 import type { AgentId, AgentRecord, HarnessKind, ProjectId, WorkflowRunInfo } from "$lib/types";
-import type { AgentRuntime, RuntimeMap, Turn } from "$lib/state/types";
-import { agentIsWorking, runtimes, transcripts } from "$lib/state/index.svelte";
+import type { RuntimeMap } from "$lib/state/types";
+import { agentIsWorking, runtimes } from "$lib/state/index.svelte";
 import {
   forwardSourceLabel,
   heldForwardsFor,
@@ -19,17 +19,15 @@ import { workflowRuns } from "$lib/state/workflows.svelte";
 import { agentsByProject } from "$lib/state/workspace.svelte";
 import { canonicalizeForUniqueness } from "$lib/nameValidation";
 
-/// Who or what a waiting agent waits on. `user` is a workflow paused for the
-/// user's input; `workflow` is a run between agents (none of its agents is
-/// working), named by the workflow.
+/// Who or what a waiting agent waits on. `workflow` is a run whose current
+/// step has no working agent, named by the workflow.
 export type WaitTarget =
   | { kind: "agent"; agentId: AgentId; name: string; harness?: HarnessKind }
-  | { kind: "user" }
   | { kind: "workflow"; name: string };
 
 export type AgentActivity =
   /// `startedAt` is the running turn's start; absent while the work is only
-  /// accepted or queued and no turn has started.
+  /// queued, and between a turn's end and the agent going idle.
   | { kind: "working"; startedAt?: string }
   | { kind: "waiting"; on: WaitTarget[] }
   | { kind: "failed"; reason: string }
@@ -41,7 +39,6 @@ export type ActivityInputs = {
   /// The agent's own project roster, in order.
   roster: AgentRecord[];
   runtimes: RuntimeMap;
-  transcript: Turn[] | undefined;
   heldForwards: HeldForward[];
   /// The project's workflow runs.
   runs: WorkflowRunInfo[];
@@ -52,7 +49,7 @@ export type ActivityInputs = {
 export function deriveAgentActivity(input: ActivityInputs): AgentActivity {
   const runtime = input.runtimes[input.agent.id];
   if (agentIsWorking(runtime)) {
-    return { kind: "working", startedAt: runningTurnStart(runtime, input.transcript) };
+    return { kind: "working", startedAt: runtime?.turn_started_at };
   }
   const on = [...heldForwardTargets(input), ...workflowTargets(input)];
   if (on.length > 0) return { kind: "waiting", on: dedupe(on) };
@@ -62,27 +59,21 @@ export function deriveAgentActivity(input: ActivityInputs): AgentActivity {
   return { kind: "idle" };
 }
 
-/// The running turn's start, only while a turn is actually streaming: between
-/// a turn's end and the agent going idle, and while work is only queued, the
-/// card shows "Working" with no time rather than a stale one.
-function runningTurnStart(
-  runtime: AgentRuntime | undefined,
-  transcript: Turn[] | undefined,
-): string | undefined {
-  if (runtime?.run_status !== "processing") return undefined;
-  const turns = transcript ?? [];
-  const streaming = (turn: Turn): boolean => turn.role === "agent" && turn.status === "streaming";
-  const inFlight = turns.find(
-    (turn) => streaming(turn) && turn.turn_id === runtime.in_flight_turn_id,
-  );
-  return (inFlight ?? [...turns].reverse().find(streaming))?.started_at;
-}
-
+/// The sources a held forward to this agent still waits on. A source is
+/// waited on while its `run_status` is not idle, the backend's own test (a send
+/// queued behind a finished turn is not held for). A source whose runtime this
+/// window doesn't hold, in an unopened project, is kept: it may be the one. If
+/// none is left while the forward is still held, all are named rather than
+/// none, so the card doesn't read idle just before the forward dispatches.
 function heldForwardTargets(input: ActivityInputs): WaitTarget[] {
   return input.heldForwards
     .filter((forward) => forward.recipients.includes(input.agent.id))
-    .flatMap((forward) =>
-      forward.sources.map(
+    .flatMap((forward) => {
+      const pending = forward.sources.filter((source) => {
+        const runtime = input.runtimes[source.id];
+        return runtime === undefined || runtime.run_status !== "idle";
+      });
+      return (pending.length > 0 ? pending : forward.sources).map(
         (source): WaitTarget => ({
           kind: "agent",
           agentId: source.id,
@@ -90,16 +81,17 @@ function heldForwardTargets(input: ActivityInputs): WaitTarget[] {
           harness: (input.roster.find((a) => a.id === source.id) ?? input.findAgent(source.id))
             ?.harness,
         }),
-      ),
-    );
+      );
+    });
 }
 
-/// A running workflow's later step names this agent. Steps name agents by
-/// their resolved name (unique within a project, compared the way the backend
-/// does), because the run's step info carries no agent ids.
+/// A running workflow's later send step names this agent. Steps name agents by
+/// the names bound when the run started (compared the way the backend does),
+/// because the run's step info carries no agent ids; an agent renamed mid-run
+/// therefore reads idle until its own step.
 ///
-/// The agent waits on the run's agents that are working now. With none working,
-/// it waits on the user when the run is paused for input, else on the run.
+/// The agent waits on the working agents of the run's current step, which are
+/// the ones a wait step waits for. With none working, it waits on the run.
 function workflowTargets(input: ActivityInputs): WaitTarget[] {
   const key = canonicalizeForUniqueness(input.agent.name);
   const names = (step: WorkflowRunInfo["steps"][number]): string[] =>
@@ -109,13 +101,12 @@ function workflowTargets(input: ActivityInputs): WaitTarget[] {
     const later = run.steps.some(
       (step, i) =>
         i > run.step &&
-        (step.kind === "send" || step.kind === "for_each") &&
+        step.kind === "send" &&
         names(step).some((name) => canonicalizeForUniqueness(name) === key),
     );
     if (!later) return [];
-    const working = run.steps
-      .slice(0, run.step + 1)
-      .flatMap(names)
+    const current = run.steps[run.step];
+    const working = (current === undefined ? [] : names(current))
       .map((name) =>
         input.roster.find(
           (a) => canonicalizeForUniqueness(a.name) === canonicalizeForUniqueness(name),
@@ -133,9 +124,7 @@ function workflowTargets(input: ActivityInputs): WaitTarget[] {
         harness: a.harness,
       }));
     }
-    return run.steps[run.step]?.kind === "pause"
-      ? [{ kind: "user" }]
-      : [{ kind: "workflow", name: run.workflow }];
+    return [{ kind: "workflow", name: run.workflow }];
   });
 }
 
@@ -144,21 +133,11 @@ function dedupe(targets: WaitTarget[]): WaitTarget[] {
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const seen = new Set<string>();
   return targets.filter((target) => {
-    const key =
-      target.kind === "agent"
-        ? `a:${target.agentId}`
-        : target.kind === "workflow"
-          ? `w:${target.name}`
-          : "u";
+    const key = target.kind === "agent" ? `a:${target.agentId}` : `w:${target.name}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
-}
-
-export function waitTargetName(target: WaitTarget): string {
-  if (target.kind === "user") return "you";
-  return target.name;
 }
 
 /// The state words for the card's accessible name, or `null` when idle. Never
@@ -168,7 +147,7 @@ export function activityPhrase(activity: AgentActivity): string | null {
     case "working":
       return "working";
     case "waiting":
-      return `waiting for ${activity.on.map(waitTargetName).join(", ")}`;
+      return `waiting for ${activity.on.map((target) => target.name).join(", ")}`;
     case "failed":
       return "last turn failed";
     case "idle":
@@ -196,7 +175,6 @@ export function agentActivity(
     projectId,
     roster,
     runtimes,
-    transcript: transcripts[agent.id],
     heldForwards: heldForwardsFor(projectId),
     runs: workflowRuns[projectId] ?? [],
     findAgent: findLoadedAgent,

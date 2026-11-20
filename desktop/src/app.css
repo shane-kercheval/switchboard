@@ -18,8 +18,9 @@
      - destructive / warning action+caution surfaces
      - status (run state) — strong foreground + soft background, so a status
        chip/dot is `bg-status-{state}-soft text-status-{state}`. `processing`
-       is violet: the one hue no other role uses, so "running" reads neither
-       as a caution (amber) nor as focus (blue) or selection (teal).
+       is violet: a hue no other UI role uses (the syntax colors aside), so
+       "running" reads neither as a caution (amber) nor as focus (blue) or
+       selection (teal).
    Harness identity is conveyed by `HarnessIcon` (brand artwork) and the
    `HARNESS_COLOR` map (transcript attribution), not by color tokens. */
 :root {

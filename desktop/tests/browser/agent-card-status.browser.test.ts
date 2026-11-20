@@ -75,14 +75,22 @@ async function seedStates(agents: AgentRecord[]): Promise<void> {
     ...state.runtimes[working!.id]!,
     run_status: "processing",
     in_flight_turn_id: "a1",
+    turn_started_at: startedAt,
   };
   addHeldForward(PROJECT_ID, {
     forwardId: "f1",
     sendId: "s9",
     body: "",
+    // A running source and one in a project this window hasn't opened, so the
+    // waiting line names one and counts the other.
     sources: [
       { id: working!.id, name: working!.name },
-      { id: failed!.id, name: failed!.name },
+      {
+        id: "00000000-0000-7000-8000-0000000000e1",
+        name: "planner",
+        projectId: "00000000-0000-7000-8000-0000000000ee",
+        projectName: "planning",
+      },
     ],
     recipients: [waiting!.id],
   });
@@ -121,6 +129,10 @@ describe("card height", () => {
         const heights = cards().map((card) => card.getBoundingClientRect().height);
         expect(new Set(heights).size, `heights ${heights.join(", ")}`).toBe(1);
 
+        expect(
+          cards()[1]!.querySelector('[data-testid="agent-status-wait-more"]'),
+        ).toHaveTextContent("+1");
+        expect(cards()[0]!.querySelector('[data-testid="agent-status-elapsed"]')).not.toBeNull();
         // The status line stays inside its card, and nothing in it overflows.
         for (const card of cards().slice(0, 3)) {
           const status = card.querySelector<HTMLElement>('[data-testid="agent-status"]')!;

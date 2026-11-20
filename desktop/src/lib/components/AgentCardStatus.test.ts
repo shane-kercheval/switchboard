@@ -93,6 +93,20 @@ async function hoverTooltip(trigger: HTMLElement): Promise<string> {
   }
 }
 
+/// A turn of `target` that fails, through to the agent going idle.
+async function failTurn(target: AgentRecord, n: number, message: string): Promise<void> {
+  await send(target, n);
+  fireTo(`agent:${target.id}`, turnStart(n));
+  fireTo(`agent:${target.id}`, {
+    type: "turn_end",
+    turn_id: `turn-${n}`,
+    outcome: { status: "failed", kind: "harness_error", message },
+    ended_at: "2026-05-16T00:00:05Z",
+  });
+  fireTo(`agent:${target.id}`, { type: "agent_idle", agent_id: target.id });
+  await tick();
+}
+
 /// A send to `target` the way the compose bar makes one: the pending row, then
 /// the accepted receipt.
 async function send(target: AgentRecord, n: number, withReceipt = true): Promise<void> {
@@ -116,6 +130,7 @@ beforeEach(async () => {
   listedRuns = [];
   invokeMock.mockClear();
   (await import("$lib/state/transcriptPanes.svelte"))._testing.reset();
+  (await import("$lib/layout.svelte"))._testing.reset();
   (await import("$lib/state/heldForwards.svelte"))._testing.reset();
   (await import("$lib/state/workflows.svelte"))._testing.reset();
 });
@@ -139,7 +154,7 @@ describe("an agent card's status", () => {
     expect(within(idle).getByTestId("agent-selection")).not.toHaveAttribute("inert");
   });
 
-  it("works from the send, through the turn, to a failure, and clears it on the next send", async () => {
+  it("works from the send, through the turn, to a failure, and clears it when the next turn starts", async () => {
     await openProject();
     await send(DOCS, 1);
     await tick();
@@ -213,6 +228,79 @@ describe("an agent card's status", () => {
     expect(card(DOCS)).toHaveAttribute("data-activity", "idle");
   });
 
+  it("keeps the failure when the next send is cancelled before its turn starts", async () => {
+    await openProject();
+    await failTurn(DOCS, 1, "claude exited with code 1");
+    await send(DOCS, 2);
+    await tick();
+    expect(card(DOCS)).toHaveAttribute("data-activity", "working");
+    fireTo(`agent:${DOCS.id}`, {
+      type: "message_cancelled",
+      message_id: "msg-2",
+      send_id: "send-2",
+      agent_id: DOCS.id,
+      at: "2026-05-16T00:00:06Z",
+    });
+    await tick();
+    expect(card(DOCS)).toHaveAttribute("data-activity", "failed");
+    expect(await hoverTooltip(within(card(DOCS)).getByTestId("agent-status"))).toContain(
+      "claude exited with code 1",
+    );
+  });
+
+  it("shows a workflow send that fails to launch as failed", async () => {
+    // A workflow send is not announced to the window, so it has no pending
+    // entry; its failure names its send.
+    await openProject();
+    fireTo(`agent:${DOCS.id}`, {
+      type: "message_failed",
+      message_id: "msg-w",
+      send_id: "send-w",
+      agent_id: DOCS.id,
+      error: "claude: command not found",
+      at: "2026-05-16T00:00:01Z",
+    });
+    await tick();
+    expect(card(DOCS)).toHaveAttribute("data-activity", "failed");
+  });
+
+  it("keeps the failure the user is investigating through a context report", async () => {
+    await openProject();
+    await failTurn(DOCS, 1, "claude exited with code 1");
+    const state = await agentState();
+    await state.dispatchContextReport(DOCS.id, "report-1");
+    fireTo(`agent:${DOCS.id}`, {
+      type: "turn_start",
+      turn_id: "turn-r",
+      message_id: "msg-r",
+      send_id: "report-1",
+      started_at: "2026-05-16T00:00:07Z",
+    });
+    await tick();
+    expect(card(DOCS)).toHaveAttribute("data-activity", "working");
+    fireTo(`agent:${DOCS.id}`, {
+      type: "turn_end",
+      turn_id: "turn-r",
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:08Z",
+    });
+    fireTo(`agent:${DOCS.id}`, { type: "agent_idle", agent_id: DOCS.id });
+    await tick();
+    expect(card(DOCS)).toHaveAttribute("data-activity", "failed");
+    expect(await hoverTooltip(within(card(DOCS)).getByTestId("agent-status"))).toContain(
+      "claude exited with code 1",
+    );
+  });
+
+  it("toggles the card when the status line is clicked", async () => {
+    await openProject();
+    await send(DOCS, 1);
+    await tick();
+    const before = card(DOCS).getAttribute("data-collapsed");
+    await fireEvent.click(within(card(DOCS)).getByTestId("agent-status"));
+    expect(card(DOCS).getAttribute("data-collapsed")).not.toBe(before);
+  });
+
   it("shows working when the turn starts before the send's receipt arrives", async () => {
     await openProject();
     await send(DOCS, 1, false);
@@ -284,6 +372,22 @@ describe("an agent card's status", () => {
     held.removeHeldForward(PROJECT_ID, "f1");
     await tick();
     expect(card(DOCS)).toHaveAttribute("data-activity", "idle");
+  });
+
+  it("names a single waiting target in full on hover", async () => {
+    await openProject();
+    const held = await import("$lib/state/heldForwards.svelte");
+    held.addHeldForward(PROJECT_ID, {
+      forwardId: "f1",
+      sendId: "send-f",
+      body: "",
+      sources: [{ id: IMPL.id, name: IMPL.name }],
+      recipients: [DOCS.id],
+    });
+    await tick();
+    const status = within(card(DOCS)).getByTestId("agent-status");
+    expect(within(status).queryByTestId("agent-status-wait-more")).toBeNull();
+    expect(await hoverTooltip(status)).toBe("Waiting for implementer");
   });
 
   it("waits on a running workflow's working agent until its own step comes", async () => {

@@ -569,7 +569,7 @@ function addPendingUserTurn(
   // its `turn_start` arrives.
   runtimes[agentId] =
     runtime.run_status === "idle"
-      ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
+      ? { ...runtime, run_status: "starting", pending_sends: pending }
       : { ...runtime, pending_sends: pending };
 }
 
@@ -642,7 +642,7 @@ function admitAnnouncedCompaction(
   ];
   runtimes[runtime.agent_id] =
     runtime.run_status === "idle"
-      ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
+      ? { ...runtime, run_status: "starting", pending_sends: pending }
       : { ...runtime, pending_sends: pending };
 }
 
@@ -693,7 +693,7 @@ export async function dispatchCompaction(
   // requested while a turn runs just queues behind it.
   runtimes[agentId] =
     runtime.run_status === "idle"
-      ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
+      ? { ...runtime, run_status: "starting", pending_sends: pending }
       : { ...runtime, pending_sends: pending };
   try {
     const messageId = await apiCompactAgent(agentId, sendId);
@@ -759,10 +759,7 @@ export async function dispatchContextReport(
     context_report_request: { send_id: sendId, phase: "queued" },
   };
   // Same rule as a send: only an idle agent moves to "starting".
-  runtimes[agentId] =
-    runtime.run_status === "idle"
-      ? { ...next, run_status: "starting", last_error: undefined }
-      : next;
+  runtimes[agentId] = runtime.run_status === "idle" ? { ...next, run_status: "starting" } : next;
   try {
     const messageId = await apiContextReportAgent(agentId, sendId);
     recordSendAccepted(agentId, pendingTurnId, messageId);
@@ -873,7 +870,8 @@ export function failSendStart(
   runtimes[agentId] = {
     ...runtime,
     run_status: runStatusAfterPendingRemoved(runtime, pending_sends),
-    last_error: error,
+    // A refused context report keeps its error on the request record above.
+    last_error: entry?.kind === "context_report" ? runtime.last_error : error,
     pending_sends,
     context_report_request,
   };

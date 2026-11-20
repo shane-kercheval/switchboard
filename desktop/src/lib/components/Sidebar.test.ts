@@ -257,11 +257,8 @@ describe("Sidebar", () => {
     expect(screen.getByText(/no agents/i)).toBeInTheDocument();
   });
 
-  // Run-status and last_error are no longer surfaced in the right sidebar:
-  // mid-turn activity shows as a per-project spinner in the projects sidebar,
-  // and failures render in the transcript as a failed agent turn (covered in
-  // the reducer + UnifiedTranscript suites). The sidebar's job here is the
-  // collapsible per-agent detail card.
+  // The card's status line (working, waiting, last turn failed) is covered in
+  // AgentCardStatus.test.ts; this suite covers the collapsible detail card.
 
   it("collapses an agent's detail card when its non-control surface is clicked", async () => {
     const state = await loadState();

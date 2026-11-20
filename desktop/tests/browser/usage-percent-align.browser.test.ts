@@ -16,6 +16,7 @@ vi.mock("$lib/state/workspace.svelte", () => ({
   historyRetryBlock: () => null,
   projects: { list: [] },
   conversations: {},
+  agentsByProject: {},
 }));
 
 import { render } from "vitest-browser-svelte";

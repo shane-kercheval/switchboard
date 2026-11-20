@@ -382,6 +382,30 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(chips).toEqual(["alice", "bob"]);
   });
 
+  it("swaps a member chip's harness icon for a spinner only while that member works, hidden or not", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    toggleAgentHidden(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+    const chip = (): HTMLElement => within(paneEls()[1]!).getByTestId("pane-member-chip");
+    expect(within(chip()).queryByTestId("pane-member-working")).toBeNull();
+
+    const state = await loadState();
+    state.runtimes[BOB.id] = { ...state.runtimes[BOB.id]!, run_status: "processing" };
+    await tick();
+    expect(within(chip()).getByTestId("pane-member-working")).toBeInTheDocument();
+    expect(chip()).toHaveTextContent(/^bob\s*, working$/);
+    expect(
+      within(within(paneEls()[0]!).getByTestId("pane-member-chip")).queryByTestId(
+        "pane-member-working",
+      ),
+    ).toBeNull();
+
+    state.runtimes[BOB.id] = { ...state.runtimes[BOB.id]!, run_status: "idle" };
+    await tick();
+    expect(within(chip()).queryByTestId("pane-member-working")).toBeNull();
+  });
+
   it("renames via the explicit edit affordance without re-targeting", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);

@@ -46,7 +46,13 @@
   import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
   import ExpandCollapseIcon from "$lib/components/ui/ExpandCollapseIcon.svelte";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
-  import { effortSupportFor, selectionChanges, selectionIsValid } from "$lib/agentSelection";
+  import {
+    EFFORT_OPTIONS,
+    effortSupportFor,
+    modelLabel,
+    selectionChanges,
+    selectionIsValid,
+  } from "$lib/agentSelection";
   import { preferences } from "$lib/preferences.svelte";
   import {
     AGENTS_SIDEBAR_DEFAULT_WIDTH,
@@ -66,7 +72,7 @@
     type AgentSessionInfo,
   } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
-  import { cn, formatTokens, isIsoTimestampAfter } from "$lib/utils";
+  import { cn, formatDuration, formatTokens, isIsoTimestampAfter } from "$lib/utils";
   import {
     contextOccupancy as occupancyFrom,
     type CompactedReading,
@@ -96,6 +102,17 @@
   import { agentIsCompactible, compactAllBlock } from "$lib/state/compactionAvailability";
   import { workflowRuns } from "$lib/state/workflows.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
+  import ActivityRing from "$lib/components/ui/ActivityRing.svelte";
+  import LoadingDots from "$lib/components/ui/LoadingDots.svelte";
+  import { SUPPLEMENTAL_TOOLTIP_DELAY } from "$lib/components/ui/tooltip";
+  import {
+    activityPhrase,
+    agentActivity,
+    waitTargetName,
+    type AgentActivity,
+    type WaitTarget,
+  } from "$lib/state/agentActivity.svelte";
+  import { now } from "$lib/state/clock.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import TruncatedText from "$lib/components/ui/TruncatedText.svelte";
@@ -119,6 +136,19 @@
       rt.run_status === "processing" ||
       (rt.pending_sends ?? []).length > 0
     );
+  }
+
+  /// The agent's next-send model and effort in words, for the status line that
+  /// covers the selection chips while the agent is busy.
+  function selectionSummary(agent: AgentRecord): string {
+    const model =
+      agent.model === null ? "Harness/session default" : modelLabel(agent.harness, agent.model);
+    const effort =
+      agent.effort === null
+        ? "Harness/session default"
+        : (EFFORT_OPTIONS[agent.harness].find((option) => option.value === agent.effort)?.label ??
+          agent.effort);
+    return `Model: ${model} · Effort: ${effort}`;
   }
 
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
@@ -1061,6 +1091,109 @@
   </div>
 {/snippet}
 
+<!-- The card's second line while the agent is not idle. Its detail (the
+     model and effort it covers, every agent waited on, a failure's reason)
+     rides a hover tooltip rather than a Tab stop; the same words sit in
+     visually hidden text, and the card's own label names the state. No live
+     region: nothing here is announced as it changes. -->
+{#snippet statusLine(
+  agent: AgentRecord,
+  activity: Exclude<AgentActivity, { kind: "idle" }>,
+  placement: string,
+)}
+  {#if activity.kind === "working"}
+    <Tooltip
+      label={selectionSummary(agent)}
+      delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+      focusable={false}
+    >
+      {#snippet trigger(props)}
+        <div
+          {...props}
+          class={cn("flex min-w-0 items-center gap-1.5 text-xs", placement)}
+          data-testid="agent-status"
+          data-status="working"
+        >
+          <span class="text-status-processing font-medium">Working</span>
+          <LoadingDots class="text-status-processing" />
+          {#if activity.startedAt !== undefined}
+            <span class="text-muted tabular-nums" data-testid="agent-status-elapsed">
+              {formatDuration(now() - Date.parse(activity.startedAt))}
+            </span>
+          {/if}
+          <span class="sr-only">{selectionSummary(agent)}</span>
+        </div>
+      {/snippet}
+    </Tooltip>
+  {:else if activity.kind === "waiting"}
+    {#if activity.on.length > 1}
+      <Tooltip
+        label={`Waiting for ${activity.on.map(waitTargetName).join(", ")}`}
+        delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY}
+        focusable={false}
+      >
+        {#snippet trigger(props)}
+          {@render waitingLine(activity.on, placement, props)}
+        {/snippet}
+      </Tooltip>
+    {:else}
+      {@render waitingLine(activity.on, placement, {})}
+    {/if}
+  {:else}
+    <Tooltip delayDuration={SUPPLEMENTAL_TOOLTIP_DELAY} focusable={false}>
+      {#snippet trigger(props)}
+        <div
+          {...props}
+          class={cn("flex min-w-0 items-center text-xs", placement)}
+          data-testid="agent-status"
+          data-status="failed"
+        >
+          <span class="text-status-failed truncate font-medium">Last turn failed</span>
+          <span class="sr-only">: {activity.reason}</span>
+        </div>
+      {/snippet}
+      <p class="max-w-xs text-[13px] break-words" data-testid="agent-status-failure-reason">
+        {activity.reason}
+      </p>
+    </Tooltip>
+  {/if}
+{/snippet}
+
+<!-- One target is named; the rest are counted, and listed by the tooltip. -->
+{#snippet waitingLine(on: WaitTarget[], placement: string, props: Record<string, unknown>)}
+  {@const first = on[0]}
+  <div
+    {...props}
+    class={cn("text-muted flex min-w-0 items-center gap-1 text-xs", placement)}
+    data-testid="agent-status"
+    data-status="waiting"
+  >
+    <span class="shrink-0">Waiting for</span>
+    {#if first !== undefined}{@render waitTarget(first)}{/if}
+    {#if on.length > 1}
+      <span class="shrink-0" data-testid="agent-status-wait-more">+{on.length - 1}</span>
+      <span class="sr-only">{on.slice(1).map(waitTargetName).join(", ")}</span>
+    {/if}
+  </div>
+{/snippet}
+
+<!-- The pane headers' member chip, at the 16px the card's line allows. -->
+{#snippet waitTarget(target: WaitTarget)}
+  {#if target.kind === "agent"}
+    <span
+      class="border-border bg-panel text-fg inline-flex h-4 min-w-0 items-center rounded-full border px-1.5 text-[11px]"
+      data-testid="agent-status-wait-chip"
+    >
+      {#if target.harness !== undefined}
+        <HarnessIcon harness={target.harness} size="sm" class="mr-1 h-3 w-3 shrink-0" />
+      {/if}
+      <span class="truncate">{target.name}</span>
+    </span>
+  {:else}
+    <span class="text-fg min-w-0 truncate">{waitTargetName(target)}</span>
+  {/if}
+{/snippet}
+
 <svelte:window onkeydown={onWindowKeydown} />
 
 <SidebarPanel side="right" width={draftWidth ?? layout.agentsSidebarWidth} testid="sidebar">
@@ -1236,6 +1369,8 @@
           agent.model_choices.length === 0 &&
           agent.effort_choices.length === 0}
         {@const isCollapsed = layout.agentCardCollapsedFor(projectId, agent.id)}
+        {@const activity = agentActivity(projectId, agent, agents)}
+        {@const phrase = activityPhrase(activity)}
         {@const active = isActive(agent.id)}
         {@const recipientSelected = !workflowActive && recipientSelection.includes(agent.id)}
         {@const sessionInfo = sessionInfoByAgent[agent.id]}
@@ -1257,7 +1392,8 @@
           data-collapsed={isCollapsed}
           data-recipient-selected={recipientSelected}
           tabindex="0"
-          aria-label={`${agent.name}, ${isCollapsed ? "collapsed" : "expanded"}. Press Enter or Space to toggle details.`}
+          aria-label={`${agent.name}, ${phrase === null ? "" : `${phrase}, `}${isCollapsed ? "collapsed" : "expanded"}. Press Enter or Space to toggle details.`}
+          data-activity={activity.kind}
           use:agentRowPointerActions={agent.id}
           animate:flip={{ duration: dragState?.started === true ? 0 : 150 }}
         >
@@ -1629,12 +1765,9 @@
                     {/if}
                   {/if}
                 </DropdownMenu>
-                <HarnessIcon
-                  harness={agent.harness}
-                  size="md"
-                  class="ml-0.5"
-                  testid="agent-harness-icon"
-                />
+                <ActivityRing active={activity.kind === "working"} class="ml-0.5">
+                  <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
+                </ActivityRing>
                 {#if agents.length > 1}
                   <span
                     class={cn(
@@ -1727,42 +1860,56 @@
           <!-- Selected model/effort is future-send intent, never observed
                  runtime history. The transcript footer owns the actual model
                  used by each completed turn. -->
+          <!-- While the card shows a status (working, waiting, or failed), the
+               status line is drawn over the selection chips, which stay laid
+               out but hidden and inert, so the card keeps its height. -->
           {#if canConfigureSelection(agent)}
-            <div
-              class="mt-1.5 flex min-w-0 flex-wrap items-center gap-1"
-              data-testid="agent-selection"
-            >
-              {#if emptySelection}
-                <span class="text-muted text-xs" data-testid="agent-selection-default">
-                  Harness/session default
-                </span>
-              {:else if agent.model_choices.length > 0}
-                <AgentSelectionChip
-                  axis="model"
-                  harness={agent.harness}
-                  selection={agentSelection}
-                  busy={selectionBusy(agent.id)}
-                  onActivate={(selection) => void activateSelection(agent, selection)}
-                />
-              {:else if agent.model === null && SUPPORTS_MODEL_SELECTION[agent.harness]}
-                <span class="text-muted text-xs" data-testid="agent-model-default">
-                  Model: Harness/session default
-                </span>
-              {/if}
-              {#if agent.effort_choices.length > 0 && effortSupport.kind !== "none"}
-                <AgentSelectionChip
-                  axis="effort"
-                  harness={agent.harness}
-                  selection={agentSelection}
-                  busy={selectionBusy(agent.id)}
-                  onActivate={(selection) => void activateSelection(agent, selection)}
-                />
-              {:else if !emptySelection && agent.effort === null && effortSupport.kind !== "none" && SUPPORTS_EFFORT_SELECTION[agent.harness]}
-                <span class="text-muted text-xs" data-testid="agent-effort-default">
-                  Effort: Harness/session default
-                </span>
+            <div class="relative mt-1.5">
+              <div
+                class={cn(
+                  "flex min-w-0 flex-wrap items-center gap-1",
+                  activity.kind !== "idle" && "invisible",
+                )}
+                data-testid="agent-selection"
+                inert={activity.kind !== "idle"}
+              >
+                {#if emptySelection}
+                  <span class="text-muted text-xs" data-testid="agent-selection-default">
+                    Harness/session default
+                  </span>
+                {:else if agent.model_choices.length > 0}
+                  <AgentSelectionChip
+                    axis="model"
+                    harness={agent.harness}
+                    selection={agentSelection}
+                    busy={selectionBusy(agent.id)}
+                    onActivate={(selection) => void activateSelection(agent, selection)}
+                  />
+                {:else if agent.model === null && SUPPORTS_MODEL_SELECTION[agent.harness]}
+                  <span class="text-muted text-xs" data-testid="agent-model-default">
+                    Model: Harness/session default
+                  </span>
+                {/if}
+                {#if agent.effort_choices.length > 0 && effortSupport.kind !== "none"}
+                  <AgentSelectionChip
+                    axis="effort"
+                    harness={agent.harness}
+                    selection={agentSelection}
+                    busy={selectionBusy(agent.id)}
+                    onActivate={(selection) => void activateSelection(agent, selection)}
+                  />
+                {:else if !emptySelection && agent.effort === null && effortSupport.kind !== "none" && SUPPORTS_EFFORT_SELECTION[agent.harness]}
+                  <span class="text-muted text-xs" data-testid="agent-effort-default">
+                    Effort: Harness/session default
+                  </span>
+                {/if}
+              </div>
+              {#if activity.kind !== "idle"}
+                {@render statusLine(agent, activity, "absolute inset-0")}
               {/if}
             </div>
+          {:else if activity.kind !== "idle"}
+            {@render statusLine(agent, activity, "mt-1.5")}
           {/if}
           {#if selectionSaveErrors[agent.id]}
             <p class="text-status-failed mt-1 text-xs" data-testid="agent-selection-save-error">

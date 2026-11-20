@@ -173,3 +173,21 @@ Since Claude Code 2.1.277, the cost and token totals on a resumed turn's `result
 - `Dispatcher::shutdown_agent`, `Dispatcher::remove_agent` and `begin_close` in `crates/dispatcher/src/lib.rs`.
 - `begin_maintenance` in `desktop/src-tauri/src/commands.rs`, and `finish_orderly_quit` in `desktop/src-tauri/src/lib.rs`.
 - G52 in `docs/harness-behavior.md`, whose quit claim names this exception.
+
+## An agent card does not say it is waiting on a forward an MCP client made
+
+**What a user would get.** When an agent such as an orchestrator calls Switchboard's MCP `forward` tool to send one agent's answer to another, the recipient's card reads "Waiting for" and the source agent's name while the forward waits for that source to finish, as it already does for a forward the user holds in the compose bar.
+
+**What we know.** Read from source on 2026-11-20.
+
+- The card's waiting state (`deriveAgentActivity` in `desktop/src/lib/state/agentActivity.svelte.ts`) reads two things the window holds: forwards held by its own compose bar (`heldForwards.svelte.ts`) and the steps of running workflows (`workflows.svelte.ts`).
+- An MCP forward waits inside `ops::send` (`desktop/src-tauri/src/ops/send.rs`): `render_body` composes the body, waiting on a source that is mid-turn, and only after that does the send call `desktop_sync.ensure_ready` and dispatch. No event reaches the window during that wait, so the window has nothing to show until the recipient's turn starts.
+
+**Why it waits.** It needs a new event from the Rust side, and its lifecycle (start, release, cancel, timeout, the window reloading meanwhile) is the larger part of the work. The card already shows the recipient as working once the forward is sent.
+
+**A candidate approach.** This is recorded, not decided. One option is for `compose_forward` to emit a "forward held" event on the project's channel with the forward id, sources and recipients, and a matching release event on every exit path, which the window would merge with its own held forwards.
+
+**Where the detail is.**
+
+- `render_body` and `compose_forward` in `desktop/src-tauri/src/ops/send.rs`.
+- `heldForwardTargets` in `desktop/src/lib/state/agentActivity.svelte.ts`.

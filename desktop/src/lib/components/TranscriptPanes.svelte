@@ -28,6 +28,7 @@
   import { cn } from "$lib/utils";
   import { shortcut } from "$lib/platform";
   import { agentIsWorking, runtimes } from "$lib/state/index.svelte";
+  import { agentActivity } from "$lib/state/agentActivity.svelte";
   import {
     MIN_PANE_WIDTH_PX,
     closePane,
@@ -652,17 +653,34 @@
                 </Tooltip>
                 <div class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
                   {#each paneMemberAgents(pane) as member (member.id)}
+                    {@const memberWorking =
+                      agentActivity(projectId, member, agents).kind === "working"}
                     <span
                       class="group/member border-border bg-panel text-fg inline-flex h-5 max-w-full min-w-0 items-center rounded-full border px-1.5 text-[11px]"
                       data-testid="pane-member-chip"
                       data-agent-id={member.id}
                     >
-                      <HarnessIcon
-                        harness={member.harness}
-                        size="sm"
-                        class="mr-1 h-3 w-3 shrink-0"
-                      />
+                      <!-- A working member's icon becomes a spinner of the same
+                           size, so the chip says which member is busy without
+                           changing width. -->
+                      {#if memberWorking}
+                        <span
+                          class="text-status-processing mr-1 inline-flex h-3 w-3 shrink-0"
+                          data-testid="pane-member-working"
+                        >
+                          <Spinner class="h-3 w-3" stillWhenReducedMotion />
+                        </span>
+                      {:else}
+                        <HarnessIcon
+                          harness={member.harness}
+                          size="sm"
+                          class="mr-1 h-3 w-3 shrink-0"
+                        />
+                      {/if}
                       <TruncatedText text={member.name} testid="pane-member-name" />
+                      {#if memberWorking}
+                        <span class="sr-only">, working</span>
+                      {/if}
                       <button
                         type="button"
                         class="text-muted hover:text-status-failed hover:border-status-failed hover:bg-status-failed-soft/70 pointer-events-none inline-flex h-4 w-0 shrink-0 items-center justify-center overflow-hidden rounded-full border border-transparent opacity-0 transition-[width,margin,opacity] group-focus-within/member:pointer-events-auto group-focus-within/member:ml-1 group-focus-within/member:w-4 group-focus-within/member:opacity-100 group-hover/member:pointer-events-auto group-hover/member:ml-1 group-hover/member:w-4 group-hover/member:opacity-100"

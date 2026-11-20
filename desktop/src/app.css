@@ -17,7 +17,10 @@
      - focus (blue — the focus ring + pale user-input surfaces; the one blue)
      - destructive / warning action+caution surfaces
      - status (run state) — strong foreground + soft background, so a status
-       chip/dot is `bg-status-{state}-soft text-status-{state}`.
+       chip/dot is `bg-status-{state}-soft text-status-{state}`. `processing`
+       is violet: a hue no other UI role uses (the syntax colors aside), so
+       "running" reads neither as a caution (amber) nor as focus (blue) or
+       selection (teal).
    Harness identity is conveyed by `HarnessIcon` (brand artwork) and the
    `HARNESS_COLOR` map (transcript attribution), not by color tokens. */
 :root {
@@ -97,15 +100,15 @@
 
   /* caution / warning — its own role, distinct from run-status "processing"
      so re-tuning run state can't silently drag warnings along (name a role,
-     not a hue). Same amber as processing today; decoupled for the future. */
+     not a hue). */
   --warning: #b45309;
   --warning-soft: #fef3c7;
 
   /* run status — strong foreground + soft background */
   --status-idle: #71717a;
   --status-idle-soft: #f4f4f5;
-  --status-processing: #b45309;
-  --status-processing-soft: #fef3c7;
+  --status-processing: #7c3aed;
+  --status-processing-soft: #ede9fe;
   --status-failed: #b91c1c;
   --status-failed-soft: #fee2e2;
   --status-cancelled: #71717a;
@@ -175,8 +178,8 @@
 
   --status-idle: #a1a1aa;
   --status-idle-soft: #27272a;
-  --status-processing: #fbbf24;
-  --status-processing-soft: #422006;
+  --status-processing: #a78bfa;
+  --status-processing-soft: #2e1065;
   --status-failed: #f87171;
   --status-failed-soft: #450a0a;
   --status-cancelled: #a1a1aa;

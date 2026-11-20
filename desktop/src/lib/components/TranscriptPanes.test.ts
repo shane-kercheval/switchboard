@@ -25,6 +25,11 @@ import {
 import { setProjectCompact, _testing as previewState } from "$lib/state/transcriptPreview.svelte";
 import { workflowRuns, _testing as workflowState } from "$lib/state/workflows.svelte";
 import {
+  addHeldForward,
+  removeHeldForward,
+  _testing as heldForwardsState,
+} from "$lib/state/heldForwards.svelte";
+import {
   beginOperation,
   finishOperation,
   _testing as composeOperationsState,
@@ -160,6 +165,7 @@ beforeEach(() => {
   panesState.reset();
   selectionState.reset();
   workflowState.reset();
+  heldForwardsState.reset();
   composeOperationsState.reset();
   focusSpy.mockReset();
   listeners.clear();
@@ -380,6 +386,58 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(names).toEqual(["Pane 1", "Pane 2"]);
     const chips = screen.getAllByTestId("pane-member-chip").map((el) => el.textContent?.trim());
     expect(chips).toEqual(["alice", "bob"]);
+  });
+
+  it("swaps a member chip's harness icon for a spinner only while that member works, hidden or not", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    toggleAgentHidden(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+    const chip = (): HTMLElement => within(paneEls()[1]!).getByTestId("pane-member-chip");
+    expect(within(chip()).queryByTestId("pane-member-working")).toBeNull();
+
+    const state = await loadState();
+    state.runtimes[BOB.id] = { ...state.runtimes[BOB.id]!, run_status: "processing" };
+    await tick();
+    expect(within(chip()).getByTestId("pane-member-working")).toBeInTheDocument();
+    expect(chip()).toHaveTextContent(/^bob\s*, working$/);
+    expect(
+      within(within(paneEls()[0]!).getByTestId("pane-member-chip")).queryByTestId(
+        "pane-member-working",
+      ),
+    ).toBeNull();
+
+    state.runtimes[BOB.id] = { ...state.runtimes[BOB.id]!, run_status: "idle" };
+    await tick();
+    expect(within(chip()).queryByTestId("pane-member-working")).toBeNull();
+  });
+
+  it("swaps a waiting member chip's harness icon for a still clock until the wait ends", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+    const chip = (): HTMLElement => within(paneEls()[1]!).getByTestId("pane-member-chip");
+    const state = await loadState();
+    state.runtimes[ALICE.id] = { ...state.runtimes[ALICE.id]!, run_status: "processing" };
+    addHeldForward(PROJECT_ID, {
+      forwardId: "f1",
+      sendId: "send-f",
+      body: "",
+      sources: [{ id: ALICE.id, name: ALICE.name }],
+      recipients: [BOB.id],
+    });
+    await tick();
+    const clock = within(chip()).getByTestId("pane-member-waiting");
+    expect(clock.tagName.toLowerCase()).toBe("svg");
+    expect(clock).toHaveAttribute("width", "12");
+    expect(clock).toHaveClass("text-muted");
+    expect(within(chip()).queryByTestId("pane-member-working")).toBeNull();
+    expect(chip()).toHaveTextContent(/^bob\s*, waiting$/);
+
+    removeHeldForward(PROJECT_ID, "f1");
+    await tick();
+    expect(within(chip()).queryByTestId("pane-member-waiting")).toBeNull();
+    expect(chip()).toHaveTextContent(/^bob$/);
   });
 
   it("renames via the explicit edit affordance without re-targeting", async () => {

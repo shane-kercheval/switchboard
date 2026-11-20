@@ -173,3 +173,58 @@ Since Claude Code 2.1.277, the cost and token totals on a resumed turn's `result
 - `Dispatcher::shutdown_agent`, `Dispatcher::remove_agent` and `begin_close` in `crates/dispatcher/src/lib.rs`.
 - `begin_maintenance` in `desktop/src-tauri/src/commands.rs`, and `finish_orderly_quit` in `desktop/src-tauri/src/lib.rs`.
 - G52 in `docs/harness-behavior.md`, whose quit claim names this exception.
+
+## An agent card does not say it is waiting on a forward an MCP client made
+
+**What a user would get.** When an agent such as an orchestrator calls Switchboard's MCP `forward` tool to send one agent's answer to another, the recipient's card reads "Waiting for" and the source agent's name while the forward waits for that source to finish, as it already does for a forward the user holds in the compose bar.
+
+**What we know.** Read from source on 2026-11-20.
+
+- The card's waiting state (`deriveAgentActivity` in `desktop/src/lib/state/agentActivity.svelte.ts`) reads two things the window holds: forwards held by its own compose bar (`heldForwards.svelte.ts`) and the steps of running workflows (`workflows.svelte.ts`).
+- An MCP forward waits inside `ops::send` (`desktop/src-tauri/src/ops/send.rs`): `render_body` composes the body, waiting on a source that is mid-turn, and only after that does the send call `desktop_sync.ensure_ready` and dispatch. No event reaches the window during that wait, so the window has nothing to show until the send is admitted, when the card starts showing "Working".
+
+**Why it waits.** It needs a new event from the Rust side, and its lifecycle (start, release, cancel, timeout, the window reloading meanwhile) is the larger part of the work. The card already shows the recipient as working once the forward is sent.
+
+**A candidate approach.** This is recorded, not decided. One option is for `compose_forward` to emit a "forward held" event on the project's channel with the forward id, sources and recipients, and a matching release event on every exit path, which the window would merge with its own held forwards.
+
+**Where the detail is.**
+
+- `render_body` and `compose_forward` in `desktop/src-tauri/src/ops/send.rs`.
+- `heldForwardTargets` in `desktop/src/lib/state/agentActivity.svelte.ts`.
+
+## An agent renamed during a workflow run shows idle instead of waiting
+
+**What a user would get.** An agent's card reads "Waiting for" while a running workflow has a later step that sends to it, even if the agent was renamed after the run started.
+
+**What we know.** Read from source on 2026-11-20.
+
+- The engine maps each step's agent names to ids once, from the roster at run start (`resolve_named_agent_ids` in `desktop/src-tauri/src/workflow.rs`), so a renamed agent still gets its step.
+- The run's step info (`WorkflowStepInfo`) carries only those start-time names (`resolve_step_display` in `desktop/src-tauri/src/workflow_commands.rs`). The card compares them with the agent's current name (`workflowTargets` in `desktop/src/lib/state/agentActivity.svelte.ts`), so after a rename it finds no match and reads idle until the agent's own step starts.
+- `rename_agent_impl` does not refuse a rename while a run is going.
+
+**Why it waits.** The fix changes `RecipientRef`, which is written into run files and returned by the MCP `list_workflow_runs` tool, for a case that needs a rename in the middle of a run.
+
+**A candidate approach.** This is recorded, not decided. One option is an optional `agent_id` on the literal `RecipientRef`, filled where the run starts from the same name-to-id map the engine uses, with a serde default so older run files still read. The card would then match later steps by id.
+
+**Where the detail is.**
+
+- `resolve_step_display` and the run start that calls it in `desktop/src-tauri/src/workflow_commands.rs`.
+- `workflowTargets` in `desktop/src/lib/state/agentActivity.svelte.ts`.
+
+## A workflow recipient written as an expression shows as raw template text
+
+**What a user would get.** A workflow step addressed to a recipient expression such as `{{- reviewer -}}` or `{{ reviewer | trim }}` shows the bound agent's name in the run's progress view, and that agent's card reads "Waiting for" before its step, as it does for `{{ reviewer }}`.
+
+**What we know.** Read from source on 2026-11-20.
+
+- The engine resolves both examples: `pure_expression` in `crates/workflow/src/template.rs` strips the optional whitespace-control dashes from a whole-string `{{ ... }}` recipient, and `resolve_agent_refs` evaluates what remains as an expression. The result must be an agent name or a list of names; an expression that gives anything else, such as a number from `length`, fails the step.
+- The display layer does not: `single_var` in `crates/workflow/src/display.rs` requires a bare `{{ name }}`, so `{{- reviewer -}}` and `{{ reviewer | trim }}` are classified as literals and shown verbatim. The progress view then shows the raw template, and the agent card never matches it to an agent.
+- No built-in workflow uses dashes or a filter in a recipient.
+
+**Why it waits.** It predates the agent card's waiting state and is a separate fix in the workflow crate.
+
+**A candidate approach.** This is recorded, not decided. One option is for the display to resolve a recipient the way the engine does, through `pure_expression` and the same expression evaluation over the run's bound inputs, with tests for `{{- name -}}` and `{{ name | trim }}`.
+
+**Where the detail is.**
+
+- `single_var` in `crates/workflow/src/display.rs` and `pure_expression` in `crates/workflow/src/template.rs`.

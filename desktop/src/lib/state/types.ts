@@ -252,9 +252,9 @@ export type PendingSend = {
 /// One in-flight or finished context-report request.
 ///
 /// A report has **no transcript row**, so it has no place for a failure to show
-/// — a failed compaction is visible because its row is; the sidebar deliberately
-/// renders no `last_error`. This record is where a report's outcome lives
-/// instead, and the panel renders it beside the previous report.
+/// — a failed compaction is visible because its row is. The agent card's "Last
+/// turn failed" line goes at the next send, so this record is where a report's
+/// outcome lives instead, and the panel renders it beside the previous report.
 ///
 /// **Cleared only by the next report dispatch, never by an ordinary send.** If a
 /// send cleared it, a failure message would vanish the moment the user typed
@@ -278,12 +278,12 @@ export type ContextReportRequest = {
 ///   when combined with `hydration_status`. After a failed turn, the agent
 ///   IS sendable again — `run_status` flips back to `"idle"` on `AgentIdle`
 ///   regardless of whether the turn succeeded or failed.
-/// - `last_error`: runtime record of the most-recent failure, rendered in the
-///   transcript as a failed agent turn. Read by no other surface, and no
-///   surface reads a failure's *kind* either — the usage store, once the lone
-///   consumer of `usage_limit`, now asks the harness for its account quota
-///   state on every turn end regardless of outcome. Does NOT gate Send.
-///   Cleared when the next turn starts.
+/// - `last_error`: runtime record of the most-recent failure. The agent card
+///   shows its message as "Last turn failed"; the transcript shows the failure
+///   as a failed agent turn. No surface reads a failure's *kind* — the usage
+///   store, once the lone consumer of `usage_limit`, now asks the harness for
+///   its account quota state on every turn end regardless of outcome. Does NOT
+///   gate Send. Cleared when the next turn starts.
 /// - `in_flight_turn_id`: heartbeat scope. The turn the timer is tracking.
 ///
 /// Conflating these (e.g., a status enum with `"errored"`) would force the
@@ -362,6 +362,10 @@ export type AgentRuntime = {
   /// IPC reply lands; this tracking key lets late events still extend the
   /// timer correctly.
   in_flight_turn_id?: TurnId;
+  /// When the running turn started (its `turn_start`), for the card's elapsed
+  /// time. Cleared at `turn_end`, so it is absent while a send is only queued
+  /// and between a turn's end and the agent going idle.
+  turn_started_at?: string;
   /// Transient: the ISO-8601 instant the heartbeat timer expired while this turn
   /// was still in flight with no activity (i.e. when the turn went "quiet").
   /// The turn is alive on the backend (it still holds the busy-lock) but silent,
@@ -381,11 +385,12 @@ export type AgentRuntime = {
   /// Reset at `turn_start` and cleared at `turn_end`, since a task never
   /// outlives its turn. Absent or empty when none is open.
   open_tasks?: OpenTask[];
-  /// Runtime record of the last turn's failure (not rendered — failures surface
-  /// in the transcript as a failed agent turn). Set on failed `TurnEnd` or a
-  /// pre-start `message_failed`; cleared on the next successful turn. Does NOT
-  /// gate sendability. (A heartbeat timeout no longer sets this — a silent turn
-  /// isn't a failure; see `quiet_since`.)
+  /// Runtime record of the last turn's failure, shown on the agent card as "Last
+  /// turn failed" (`agentActivity.svelte.ts`). Set on failed `TurnEnd` or a
+  /// pre-start `message_failed`; cleared when the next turn starts. A context
+  /// report neither sets nor clears it: its outcome lives on
+  /// `context_report_request`. Does NOT gate sendability. A heartbeat timeout
+  /// does not set it: a silent turn isn't a failure (see `quiet_since`).
   last_error?: { message: string; kind: FailureKind };
   /// Populated by live `SessionMeta` events or by disk hydration of the
   /// agent's session file. Undefined on agents whose first dispatch

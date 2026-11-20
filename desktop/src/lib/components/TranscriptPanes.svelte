@@ -12,7 +12,16 @@
   /// the coverage border *derives* from the selection ∩ membership. Nothing
   /// here stores a targeted pane — a stored target could drift from the real
   /// recipient set and lie.
-  import { Check, Maximize2, Minimize2, MoreHorizontal, Pencil, Square, X } from "@lucide/svelte";
+  import {
+    Check,
+    Clock,
+    Maximize2,
+    Minimize2,
+    MoreHorizontal,
+    Pencil,
+    Square,
+    X,
+  } from "@lucide/svelte";
   import type { AgentId, AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import Button from "$lib/components/ui/Button.svelte";
@@ -28,6 +37,7 @@
   import { cn } from "$lib/utils";
   import { shortcut } from "$lib/platform";
   import { agentIsWorking, runtimes } from "$lib/state/index.svelte";
+  import { agentActivity } from "$lib/state/agentActivity.svelte";
   import {
     MIN_PANE_WIDTH_PX,
     closePane,
@@ -652,17 +662,42 @@
                 </Tooltip>
                 <div class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
                   {#each paneMemberAgents(pane) as member (member.id)}
+                    {@const memberActivity = agentActivity(projectId, member, agents).kind}
                     <span
                       class="group/member border-border bg-panel text-fg inline-flex h-5 max-w-full min-w-0 items-center rounded-full border px-1.5 text-[11px]"
                       data-testid="pane-member-chip"
                       data-agent-id={member.id}
                     >
-                      <HarnessIcon
-                        harness={member.harness}
-                        size="sm"
-                        class="mr-1 h-3 w-3 shrink-0"
-                      />
+                      <!-- A working member's icon becomes a spinner, and a
+                           waiting member's a clock, of the same size, so the
+                           chip says which member is busy without changing
+                           width. -->
+                      {#if memberActivity === "working"}
+                        <span
+                          class="text-status-processing mr-1 inline-flex h-3 w-3 shrink-0"
+                          data-testid="pane-member-working"
+                        >
+                          <Spinner class="h-3 w-3" stillWhenReducedMotion />
+                        </span>
+                      {:else if memberActivity === "waiting"}
+                        <Clock
+                          size={12}
+                          strokeWidth={2}
+                          class="text-muted mr-1 shrink-0"
+                          aria-hidden="true"
+                          data-testid="pane-member-waiting"
+                        />
+                      {:else}
+                        <HarnessIcon
+                          harness={member.harness}
+                          size="sm"
+                          class="mr-1 h-3 w-3 shrink-0"
+                        />
+                      {/if}
                       <TruncatedText text={member.name} testid="pane-member-name" />
+                      {#if memberActivity === "working" || memberActivity === "waiting"}
+                        <span class="sr-only">, {memberActivity}</span>
+                      {/if}
                       <button
                         type="button"
                         class="text-muted hover:text-status-failed hover:border-status-failed hover:bg-status-failed-soft/70 pointer-events-none inline-flex h-4 w-0 shrink-0 items-center justify-center overflow-hidden rounded-full border border-transparent opacity-0 transition-[width,margin,opacity] group-focus-within/member:pointer-events-auto group-focus-within/member:ml-1 group-focus-within/member:w-4 group-focus-within/member:opacity-100 group-hover/member:pointer-events-auto group-hover/member:ml-1 group-hover/member:w-4 group-hover/member:opacity-100"

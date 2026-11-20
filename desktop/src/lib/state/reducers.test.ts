@@ -1691,6 +1691,104 @@ describe("runtimeReducer", () => {
     expect(r.last_error).toEqual({ message: "boom", kind: "harness_error" });
   });
 
+  it("records the running turn's start from turn_start and clears it when the turn ends", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1, MESSAGE_1, "2026-05-16T00:00:10Z"));
+    expect(r.turn_started_at).toBe("2026-05-16T00:00:10Z");
+    r = runtimeReducer(r, turnEndCompleted(TURN_1));
+    expect(r.turn_started_at).toBeUndefined();
+    r = runtimeReducer(r, turnStart(TURN_2, MESSAGE_1, "2026-05-16T00:00:20Z"));
+    r = runtimeReducer(r, turnEndFailed(TURN_2, "boom"));
+    expect(r.turn_started_at).toBeUndefined();
+  });
+
+  describe("a context report leaves the failure alone", () => {
+    const failed: AgentRuntime = {
+      ...freshRuntime(AGENT_A),
+      last_error: { message: "the real failure", kind: "harness_error" },
+    };
+    const queued = (): AgentRuntime => ({
+      ...failed,
+      run_status: "starting",
+      pending_sends: [
+        { send_id: "report-1", user_turn_id: "u-r", message_id: MESSAGE_1, kind: "context_report" },
+      ],
+      context_report_request: { send_id: "report-1", message_id: MESSAGE_1, phase: "queued" },
+    });
+
+    it("keeps it through the report's start and a completed end", () => {
+      let r = runtimeReducer(queued(), turnStart(TURN_1, MESSAGE_1));
+      expect(r.last_error?.message).toBe("the real failure");
+      r = runtimeReducer(r, turnEndCompleted(TURN_1));
+      expect(r.last_error?.message).toBe("the real failure");
+    });
+
+    it("keeps it when the report fails, and the report's record holds its error", () => {
+      let r = runtimeReducer(queued(), turnStart(TURN_1, MESSAGE_1));
+      r = runtimeReducer(r, turnEndFailed(TURN_1, "report failed"));
+      expect(r.last_error?.message).toBe("the real failure");
+      expect(r.context_report_request?.phase).toBe("failed");
+    });
+
+    it("keeps it when the report fails before it starts", () => {
+      const r = runtimeReducer(queued(), {
+        type: "message_failed",
+        message_id: MESSAGE_1,
+        send_id: null,
+        agent_id: AGENT_A,
+        error: "report refused",
+        at: "2026-05-16T00:00:00Z",
+      });
+      expect(r.last_error?.message).toBe("the real failure");
+      expect(r.pending_sends).toBeUndefined();
+    });
+
+    it("an ordinary turn after it still clears the failure", () => {
+      const r = runtimeReducer(failed, turnStart(TURN_2, MESSAGE_1));
+      expect(r.last_error).toBeUndefined();
+    });
+  });
+
+  describe("a pre-start failure with no pending entry", () => {
+    const unmatched = (sendId: string | null): NormalizedEvent => ({
+      type: "message_failed",
+      message_id: MESSAGE_2,
+      send_id: sendId,
+      agent_id: AGENT_A,
+      error: "claude: command not found",
+      at: "2026-05-16T00:00:00Z",
+    });
+
+    it("records a workflow send's failure: it names its send and no turn is running", () => {
+      const r = runtimeReducer(fresh(), unmatched("send-w"));
+      expect(r.last_error).toEqual({
+        message: "claude: command not found",
+        kind: "adapter_failure",
+      });
+    });
+
+    it("ignores a shutdown's abandoned item, which names no send", () => {
+      const r = runtimeReducer(fresh(), unmatched(null));
+      expect(r.last_error).toBeUndefined();
+    });
+
+    it("records a queued workflow send's failure that arrives before agent_idle", () => {
+      // The dispatcher sends no agent_idle between queued turns, so the next
+      // send's launch failure lands while the window still shows processing.
+      let r = runtimeReducer(fresh(), turnStart(TURN_1));
+      r = runtimeReducer(r, turnEndCompleted(TURN_1));
+      expect(r.run_status).toBe("processing");
+      r = runtimeReducer(r, unmatched("send-w"));
+      expect(r.last_error?.message).toBe("claude: command not found");
+      r = runtimeReducer(r, { type: "agent_idle", agent_id: AGENT_A });
+      expect(r.last_error?.message).toBe("claude: command not found");
+    });
+
+    it("ignores one that arrives while a turn is running", () => {
+      const r = runtimeReducer(runtimeReducer(fresh(), turnStart(TURN_1)), unmatched("send-w"));
+      expect(r.last_error).toBeUndefined();
+    });
+  });
+
   it("agent_idle → run_status=idle + clears in_flight_turn_id", () => {
     let r = runtimeReducer(fresh(), turnStart(TURN_1));
     r = runtimeReducer(r, { type: "agent_idle", agent_id: AGENT_A });

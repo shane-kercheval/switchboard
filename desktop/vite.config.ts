@@ -1,4 +1,5 @@
 import { defineConfig, configDefaults } from "vitest/config";
+import type { BrowserCommand } from "vitest/node";
 import { playwright } from "@vitest/browser-playwright";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import tailwindcss from "@tailwindcss/vite";
@@ -10,6 +11,12 @@ const host = process.env.TAURI_DEV_HOST;
 // layout-coupled behavior jsdom can't see; everything else stays in the fast
 // jsdom project. See docs/implementation_plans/2026-06-08-webkit-component-tests.md.
 const BROWSER_SPECS = ["**/*.browser.{test,spec}.ts"];
+
+// Runs in Node with the Playwright page, the only place `prefers-reduced-motion`
+// can be emulated; specs call it as `commands.setReducedMotion(true)`.
+const setReducedMotion: BrowserCommand<[reduce: boolean]> = async (ctx, reduce) => {
+  await ctx.page.emulateMedia({ reducedMotion: reduce ? "reduce" : "no-preference" });
+};
 
 export default defineConfig({
   plugins: [svelte(), tailwindcss()],
@@ -81,6 +88,7 @@ export default defineConfig({
             provider: playwright(),
             headless: true,
             instances: [{ browser: "webkit" }],
+            commands: { setReducedMotion },
           },
         },
       },

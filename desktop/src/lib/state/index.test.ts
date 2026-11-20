@@ -671,13 +671,11 @@ describe("dispatchUserTurn", () => {
     expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
   });
 
-  it("clears last_error on a successful new dispatch", async () => {
-    // A failed prior turn left last_error set; a fresh dispatch clears
-    // it so the sidebar doesn't show stale error state through the
-    // following successful turn.
+  it("keeps last_error through a new dispatch until that send's turn starts", async () => {
+    // The card's "Last turn failed" lasts until a new turn starts, so a send
+    // cancelled before it starts leaves the failure showing.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    // Simulate prior failure: directly set last_error on the runtime.
     const before = state.runtimes[AGENT_A];
     if (before === undefined) throw new Error("unreachable");
     state.runtimes[AGENT_A] = {
@@ -685,6 +683,15 @@ describe("dispatchUserTurn", () => {
       last_error: { message: "old failure", kind: "harness_error" },
     };
     state.dispatchUserTurn(AGENT_A, "user-1", "retry", [], "s1", "2026-05-16T00:00:00Z");
+    state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
+    expect(state.runtimes[AGENT_A]?.last_error?.message).toBe("old failure");
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      send_id: "s1",
+      started_at: "2026-05-16T00:00:01Z",
+    });
     expect(state.runtimes[AGENT_A]?.last_error).toBeUndefined();
   });
 
@@ -1993,6 +2000,12 @@ describe("context breakdown requests", () => {
   it("records an IPC rejection on the request and renders no failed row", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
+    const before = state.runtimes[AGENT_A];
+    if (before === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_A] = {
+      ...before,
+      last_error: { message: "the turn the user is investigating", kind: "harness_error" },
+    };
     invokeMock.mockRejectedValue(new Error("alice has no conversation to analyze yet"));
 
     await state.dispatchContextReport(AGENT_A, SEND, PENDING, QUEUED_AT);
@@ -2001,6 +2014,8 @@ describe("context breakdown requests", () => {
       phase: "failed",
       error: "alice has no conversation to analyze yet",
     });
+    // The report's error stays on its record; the card keeps the earlier failure.
+    expect(state.runtimes[AGENT_A]?.last_error?.message).toBe("the turn the user is investigating");
     expect(state.transcripts[AGENT_A]).toEqual([]);
     expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
     expect(state.runtimes[AGENT_A]?.run_status).toBe("idle");

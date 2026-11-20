@@ -721,6 +721,12 @@ function nextOpenTasks(
   }
 }
 
+/// Whether `turnId` is the context report's turn. Read after
+/// `advanceContextReportRequest`, which records the turn id at its start.
+function isContextReportTurn(runtime: AgentRuntime, turnId: string): boolean {
+  return runtime.context_report_request?.turn_id === turnId;
+}
+
 export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): AgentRuntime {
   runtime = advanceContextReportRequest(runtime, input);
   switch (input.type) {
@@ -737,13 +743,17 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // Sets unconditionally (not guarded on prior state): a regression
       // that emitted `TurnStart` while the runtime was `idle` should
       // still land on `processing` rather than silently dropping the
-      // event. `last_error` and `pending_message_id` are cleared so a
-      // successful new dispatch doesn't surface stale state.
+      // event. `pending_message_id` is cleared so a new dispatch doesn't
+      // surface stale state. `last_error` ("Last turn failed") is cleared here
+      // and nowhere else, except when the turn is a context report: a report is
+      // a diagnostic the user opens to investigate a failure, so it never
+      // touches it.
       return {
         ...runtime,
         run_status: "processing",
         in_flight_turn_id: input.turn_id,
-        last_error: undefined,
+        turn_started_at: input.started_at,
+        last_error: isContextReportTurn(runtime, input.turn_id) ? runtime.last_error : undefined,
         quiet_since: undefined,
         open_tasks: undefined,
         // Consume the pending-send entry this turn belongs to (by message_id,
@@ -762,19 +772,39 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
     case "message_failed": {
       // A send failed before any turn started (journal write failed, or the
       // adapter failed to launch pre-`TurnStart`). Prune its pending entry (by
-      // message_id, else front) and surface the error. A truly stray event
-      // (no pending sends) is ignored.
+      // message_id, else front) and surface the error.
+      const failure: { message: string; kind: FailureKind } = {
+        message: input.error,
+        kind: "adapter_failure",
+      };
       const idx = pickPendingIndex(
         runtime.pending_sends,
         input.message_id,
         input.send_id ?? undefined,
       );
-      if (idx < 0) return runtime;
+      if (idx < 0) {
+        // A workflow send has no pending entry here (the backend does not
+        // announce it), so its failure arrives unmatched. It can arrive while
+        // the window still shows `processing`: the dispatcher sends no
+        // `agent_idle` between queued turns. It always arrives after the
+        // previous turn's `turn_end`, though, since the dispatcher runs one item
+        // at a time, so no turn is running. Only a failure naming its send
+        // counts: the dispatcher sends none for a journal-write failure, a
+        // preflight or prompt-size refusal, or a shutdown's abandoned items. One
+        // arriving while a turn runs is stale. One arriving while a send is
+        // pending is dropped, because that send's turn usually starts next and
+        // clears it; when the pending send is a context report or is cancelled
+        // before it starts, the card loses the failure.
+        const isWorkflowFailure =
+          input.send_id !== null &&
+          runtime.turn_started_at === undefined &&
+          (runtime.pending_sends === undefined || runtime.pending_sends.length === 0);
+        return isWorkflowFailure ? { ...runtime, last_error: failure } : runtime;
+      }
+      const failedEntry = runtime.pending_sends?.[idx];
       const pending_sends = removePending(runtime.pending_sends, idx);
-      const last_error: { message: string; kind: FailureKind } = {
-        message: input.error,
-        kind: "adapter_failure",
-      };
+      // A failed context report keeps its error on the report's own record.
+      const last_error = failedEntry?.kind === "context_report" ? runtime.last_error : failure;
       // `starting` ends only when no queued entry is left
       // (`runStatusAfterPendingRemoved`): a queued send that fails while
       // another turn is `processing` must not stomp the live turn, and one
@@ -826,18 +856,26 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // A turn's open tasks end with it: a Claude turn ends only when its
       // process exits.
       if (input.outcome.status === "cancelled" || input.outcome.status === "completed") {
-        return runtime.quiet_since !== undefined || runtime.open_tasks !== undefined
-          ? { ...runtime, quiet_since: undefined, open_tasks: undefined }
+        return runtime.quiet_since !== undefined ||
+          runtime.open_tasks !== undefined ||
+          runtime.turn_started_at !== undefined
+          ? {
+              ...runtime,
+              quiet_since: undefined,
+              open_tasks: undefined,
+              turn_started_at: undefined,
+            }
           : runtime;
       }
       return {
         ...runtime,
         quiet_since: undefined,
         open_tasks: undefined,
-        last_error: {
-          message: input.outcome.message,
-          kind: input.outcome.kind,
-        },
+        turn_started_at: undefined,
+        // A failed context report keeps its error on the report's own record.
+        last_error: isContextReportTurn(runtime, input.turn_id)
+          ? runtime.last_error
+          : { message: input.outcome.message, kind: input.outcome.kind },
       };
 
     case "agent_idle":
@@ -858,6 +896,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         ...runtime,
         run_status: "idle",
         in_flight_turn_id: undefined,
+        turn_started_at: undefined,
         quiet_since: undefined,
         open_tasks: undefined,
       };

@@ -64,9 +64,10 @@
 //!     "seconds": 30,                 //   runs a command: leading its own session on a
 //!     "shell_pid_file": "<path>",    //   terminal of its own, ignoring SIGHUP. It starts
 //!     "worker_pid_file": "<path>",   //   `sleep <seconds>` in a process group of its own
-//!     "after_term": false            //   and waits for it; each writes its pid, and this
-//!   }                                //   process waits for both. after_term starts it
-//! }                                  //   only once SIGTERM arrives, which is then held
+//!     "ready_file": "<path>",        //   and waits for it; each writes its pid. This
+//!     "after_term": false            //   process waits for both, checks the worker's
+//!   }                                //   group, then creates ready_file. after_term starts
+//! }                                  //   it only once SIGTERM arrives, which is then held
 //! ```
 //!
 //! ## CLI log (`--log-file`)
@@ -169,8 +170,12 @@ struct CommandShell {
     seconds: u64,
     shell_pid_file: String,
     worker_pid_file: String,
+    /// Created once both pids are written and the worker is known to lead a
+    /// process group of its own.
+    ready_file: String,
     /// Block SIGTERM, and start the shell only once SIGTERM arrives, so the
-    /// shell exists only while this process exits.
+    /// shell exists only while this process exits. Not for a script with a
+    /// `leftover`: it would start with SIGTERM blocked too.
     #[serde(default)]
     after_term: bool,
 }
@@ -308,7 +313,7 @@ fn start_command_shell_on_sigterm(held: SigSet, shell: &CommandShell) {
 }
 
 /// Start `shell` the way `agy` starts a command, and return once the shell
-/// and its worker have written their pids.
+/// and its worker have written their pids and the ready file is created.
 ///
 /// `agy` runs each command as `zsh -c <command>` leading its own session on a
 /// terminal it opens, with SIGHUP ignored, so the shell outlives `agy`.
@@ -342,6 +347,10 @@ fn start_command_shell(shell: &CommandShell) {
         if std::path::Path::new(&shell.shell_pid_file).exists() {
             #[cfg(unix)]
             check_worker_group(&shell.worker_pid_file);
+            if let Err(e) = std::fs::write(&shell.ready_file, "") {
+                eprintln!("fake_agy: cannot create the ready file: {e}");
+                std::process::exit(1);
+            }
             return;
         }
         sleep(Duration::from_millis(10));

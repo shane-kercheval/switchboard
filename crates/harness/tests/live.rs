@@ -5390,22 +5390,28 @@ const BACKGROUNDED_COMMAND_SECONDS: u64 = 25;
 const BACKGROUNDED_COMMAND_WAIT_MS: u64 = 5000;
 
 /// A Stop must end a command `agy` has moved to the background (G52 in
-/// `docs/harness-behavior.md`). The command's shell writes its pid, and a
-/// child of the shell sleeps and then touches a marker, so a kill that
-/// reaches only the shell fails this too. The Stop comes once `agy` reports
-/// the command running as a background task. Before the fix the shell
-/// outlived the Stop, reparented to launchd, and the marker appeared.
+/// `docs/harness-behavior.md`). The command's shell writes its pid and runs a
+/// worker, a second shell that writes its own pid, sleeps, and then touches a
+/// marker. The trailing `echo done` keeps `zsh` from running the worker in its
+/// own place, so a kill that reaches only the shell fails this too. The Stop
+/// comes once `agy` reports the command running as a background task. Before
+/// the fix the shell outlived the Stop, reparented to launchd, and the marker
+/// appeared.
 #[tokio::test]
 #[ignore = "requires antigravity installed — run with: make test-live"]
 #[serial_test::serial(antigravity)]
 async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
     let cwd = tempfile::TempDir::new().unwrap();
-    let (pid_file, marker) = (cwd.path().join("shell.pid"), cwd.path().join("marker"));
+    let shell_file = cwd.path().join("shell.pid");
+    let worker_file = cwd.path().join("worker.pid");
+    let marker = cwd.path().join("marker");
     let prompt = format!(
         "Use the run_command tool to run exactly this command, with WaitMsBeforeAsync set to \
-         {BACKGROUNDED_COMMAND_WAIT_MS}: echo $$ > {}; sh -c 'sleep \
-         {BACKGROUNDED_COMMAND_SECONDS}; touch {}'\nThen reply with the single word ack.",
-        pid_file.display(),
+         {BACKGROUNDED_COMMAND_WAIT_MS}: echo $$ > {}; sh -c 'echo $$ > {}; sleep \
+         {BACKGROUNDED_COMMAND_SECONDS}; touch {}'; echo done\nThen reply with the single word \
+         ack.",
+        shell_file.display(),
+        worker_file.display(),
         marker.display()
     );
     let token = tokio_util::sync::CancellationToken::new();
@@ -5424,7 +5430,7 @@ async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
         .await
         .expect("dispatch should succeed with real agy");
     let (moved_tx, moved_rx) = tokio::sync::oneshot::channel();
-    let command = pid_file.display().to_string();
+    let command = shell_file.display().to_string();
     let collector = tokio::spawn(async move {
         let mut events = Vec::new();
         let mut moved_tx = Some(moved_tx);
@@ -5450,21 +5456,29 @@ async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
              nothing; events: {events:?}"
         );
     }
-    let Some((shell, found)) = live_shell_pid(&pid_file).await else {
+    let (Some(shell), Some(worker)) = (live_pid(&shell_file).await, live_pid(&worker_file).await)
+    else {
         token.cancel();
         let events = collector.await.unwrap();
-        panic!("the command never wrote its shell's pid; events: {events:?}");
+        panic!("the command never wrote both pids; events: {events:?}");
     };
-    let running_at_stop = nix::sys::signal::kill(shell, None).is_ok();
+    if shell == worker {
+        token.cancel();
+        let _ = collector.await;
+        panic!("the worker ran in the shell's place, so this run tested nothing");
+    }
+    let found = std::time::Instant::now();
+    let alive = |pid| nix::sys::signal::kill(pid, None).is_ok();
+    let running_at_stop = alive(shell) && alive(worker);
     token.cancel();
     let events = tokio::time::timeout(std::time::Duration::from_secs(30), collector)
         .await
         .expect("the stopped turn ended within 30 s")
         .unwrap();
-    let mut shell_ended = false;
+    let mut ended = (false, false);
     for _ in 0..300 {
-        if nix::sys::signal::kill(shell, None).is_err() {
-            shell_ended = true;
+        ended = (!alive(shell), !alive(worker));
+        if ended == (true, true) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -5483,9 +5497,10 @@ async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
             .any(|event| matches!(event, AdapterEvent::TurnEnd { .. })),
         "a stopped turn ends with no terminal; events: {events:?}"
     );
-    assert!(
-        shell_ended,
-        "the command's shell outlived the Stop (marker touched: {finished})"
+    assert_eq!(
+        ended,
+        (true, true),
+        "(shell ended, worker ended) after the Stop (marker touched: {finished})"
     );
     assert!(
         !finished,
@@ -5493,17 +5508,17 @@ async fn live_antigravity_cancel_ends_a_command_moved_to_the_background() {
     );
 }
 
-/// The pid the live command's shell wrote to `pid_file`, and when it was
-/// found, or `None` if it is not there within two minutes. A pid of 0 or 1
-/// counts as none: signalling either would reach far beyond the command.
-async fn live_shell_pid(pid_file: &Path) -> Option<(nix::unistd::Pid, std::time::Instant)> {
+/// The pid the live command wrote to `pid_file`, or `None` if it is not there
+/// within two minutes. A pid of 0 or 1 counts as none: signalling either
+/// would reach far beyond the command.
+async fn live_pid(pid_file: &Path) -> Option<nix::unistd::Pid> {
     for _ in 0..1200 {
         if let Some(pid) = std::fs::read_to_string(pid_file)
             .ok()
             .and_then(|text| text.trim().parse::<i32>().ok())
             .filter(|&pid| pid > 1)
         {
-            return Some((nix::unistd::Pid::from_raw(pid), std::time::Instant::now()));
+            return Some(nix::unistd::Pid::from_raw(pid));
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }

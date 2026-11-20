@@ -2314,18 +2314,22 @@ async fn a_forked_resume_heals_though_a_child_holds_stderr() {
 #[cfg(target_os = "macos")]
 const COMMAND_SECONDS: u64 = 30;
 
-/// Where the fixture's command shell and its worker write their pids.
+/// Where the fixture's command shell and its worker write their pids, and
+/// the file `fake_agy` creates once it has checked the worker leads a process
+/// group of its own.
 #[cfg(target_os = "macos")]
-struct CommandPids {
+struct CommandFiles {
     shell: std::path::PathBuf,
     worker: std::path::PathBuf,
+    ready: std::path::PathBuf,
 }
 
 #[cfg(target_os = "macos")]
-fn command_pids(cwd: &Path) -> CommandPids {
-    CommandPids {
+fn command_files(cwd: &Path) -> CommandFiles {
+    CommandFiles {
         shell: cwd.join("shell.pid"),
         worker: cwd.join("worker.pid"),
+        ready: cwd.join("command.ready"),
     }
 }
 
@@ -2336,36 +2340,37 @@ fn command_pids(cwd: &Path) -> CommandPids {
 /// arrives.
 #[cfg(target_os = "macos")]
 fn command_shell(cwd: &Path, after_term: bool) -> Value {
-    let pids = command_pids(cwd);
+    let files = command_files(cwd);
     json!({
         "seconds": COMMAND_SECONDS,
-        "shell_pid_file": pids.shell.to_str().unwrap(),
-        "worker_pid_file": pids.worker.to_str().unwrap(),
+        "shell_pid_file": files.shell.to_str().unwrap(),
+        "worker_pid_file": files.worker.to_str().unwrap(),
+        "ready_file": files.ready.to_str().unwrap(),
         "after_term": after_term,
     })
 }
 
 /// Whether the command's shell and its worker are both gone within a few
-/// seconds.
+/// seconds, once `fake_agy` reports the command ready.
 #[cfg(target_os = "macos")]
 async fn command_ends(cwd: &Path) -> (bool, bool) {
-    let pids = command_pids(cwd);
-    wait_for_pid_file(&pids.shell).await;
+    let files = command_files(cwd);
+    wait_for_file(&files.ready).await;
     (
-        leftover_ends(&pids.shell).await,
-        leftover_ends(&pids.worker).await,
+        leftover_ends(&files.shell).await,
+        leftover_ends(&files.worker).await,
     )
 }
 
-/// Wait for `pid_file`, which `fake_agy` waits for before writing anything.
-async fn wait_for_pid_file(pid_file: &Path) {
+/// Wait up to 15 s for `fake_agy` to create `path`.
+async fn wait_for_file(path: &Path) {
     for _ in 0..1500 {
-        if pid_file.exists() {
+        if path.exists() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("{} never appeared", pid_file.display());
+    panic!("{} never appeared", path.display());
 }
 
 /// Dispatch a turn whose `agy` hangs, Stop it once `ready` exists, and
@@ -2380,7 +2385,7 @@ async fn stop_once(adapter: &AntigravityAdapter, cwd: &Path, ready: &Path) -> Ve
         .dispatch(&agy_agent(), cwd, "hi", Uuid::now_v7(), options)
         .await
         .expect("dispatch should succeed");
-    wait_for_pid_file(ready).await;
+    wait_for_file(ready).await;
     token.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(30), stream.collect())
         .await
@@ -2408,7 +2413,7 @@ async fn a_stop_ends_a_command_agy_runs_on_its_own_terminal() {
         }),
     );
 
-    let events = stop_once(&adapter, cwd.path(), &command_pids(cwd.path()).shell).await;
+    let events = stop_once(&adapter, cwd.path(), &command_files(cwd.path()).ready).await;
     let (shell_ended, worker_ended) = command_ends(cwd.path()).await;
     assert!(
         !has_turn_end(&events),

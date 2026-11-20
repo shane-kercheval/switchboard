@@ -18875,10 +18875,12 @@ mod tests {
     /// background (G52 in `docs/harness-behavior.md`). This runs
     /// `drain_agents_then_release_locks`, the function quit runs, with a real
     /// dispatcher and a real Antigravity agent; only the window and `app.exit`
-    /// around it are left out. The command's shell writes its pid, and a child
-    /// of the shell sleeps and then touches a marker. The drain comes once
-    /// `agy` reports the command running as a background task. The shell must
-    /// be gone when the drain returns, since quit exits the app right after.
+    /// around it are left out. The command's shell writes its pid and runs a
+    /// worker, a second shell that writes its own pid, sleeps, and then
+    /// touches a marker; the trailing `echo done` keeps `zsh` from running the
+    /// worker in its own place. The drain comes once `agy` reports the command
+    /// running as a background task. Both must be gone when the drain returns,
+    /// since quit exits the app right after.
     #[tokio::test]
     #[ignore = "requires antigravity installed — run with: make test-live"]
     #[serial_test::serial(antigravity)]
@@ -18907,34 +18909,44 @@ mod tests {
             AgentSelection::default(),
         )
         .unwrap();
-        let (pid_file, marker) = (tmp.path().join("shell.pid"), tmp.path().join("marker"));
+        let shell_file = tmp.path().join("shell.pid");
+        let worker_file = tmp.path().join("worker.pid");
+        let marker = tmp.path().join("marker");
         let prompt = format!(
             "Use the run_command tool to run exactly this command, with WaitMsBeforeAsync set \
-             to {COMMAND_WAIT_MS}: echo $$ > {}; sh -c 'sleep {COMMAND_SECONDS}; touch {}'\n\
-             Then reply with the single word ack.",
-            pid_file.display(),
+             to {COMMAND_WAIT_MS}: echo $$ > {}; sh -c 'echo $$ > {}; sleep {COMMAND_SECONDS}; \
+             touch {}'; echo done\nThen reply with the single word ack.",
+            shell_file.display(),
+            worker_file.display(),
             marker.display()
         );
         send_msg(&state, agent.id, &prompt).await.unwrap();
 
-        let command = pid_file.display().to_string();
+        let command = shell_file.display().to_string();
         let moved = tokio::time::timeout(
             std::time::Duration::from_mins(2),
             emitter.wait_for(|events| {
                 events.iter().any(|(_, event)| {
-                    let event = event.to_string();
-                    event.contains("running as a background task") && event.contains(&command)
+                    event["type"] == "tool_completed"
+                        && event["output"].as_str().is_some_and(|output| {
+                            output.contains("running as a background task")
+                                && output.contains(&command)
+                        })
                 })
             }),
         )
         .await;
         // A pid of 0 or 1 counts as none: signalling either would reach far
         // beyond the command.
-        let shell = std::fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-            .filter(|&pid| pid > 1);
-        let (Ok(()), Some(shell)) = (moved, shell) else {
+        let read_pid = |file: &std::path::Path| {
+            std::fs::read_to_string(file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .filter(|&pid| pid > 1)
+        };
+        let (Ok(()), Some(shell), Some(worker)) =
+            (moved, read_pid(&shell_file), read_pid(&worker_file))
+        else {
             drain_agents_then_release_locks(
                 &state,
                 &[agent.id],
@@ -18943,20 +18955,30 @@ mod tests {
             )
             .await;
             panic!(
-                "agy never reported the command running as a background task with its shell's \
-                 pid written, so this run tested nothing; events: {:?}",
+                "agy never reported the command running as a background task with both pids \
+                 written, so this run tested nothing; events: {:?}",
                 emitter.snapshot()
             );
         };
+        if shell == worker {
+            drain_agents_then_release_locks(
+                &state,
+                &[agent.id],
+                &[project.id],
+                CancelSource::Shutdown,
+            )
+            .await;
+            panic!("the worker ran in the shell's place, so this run tested nothing");
+        }
         let found = std::time::Instant::now();
-        let running_at_quit = process_running(shell);
+        let running_at_quit = process_running(shell) && process_running(worker);
         drain_agents_then_release_locks(&state, &[agent.id], &[project.id], CancelSource::Shutdown)
             .await;
-        // Only launchd reaping the shell may lag the drain.
-        let mut shell_ended = false;
+        // Only launchd reaping the two may lag the drain.
+        let mut ended = (false, false);
         for _ in 0..20 {
-            if !process_running(shell) {
-                shell_ended = true;
+            ended = (!process_running(shell), !process_running(worker));
+            if ended == (true, true) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -18969,10 +18991,10 @@ mod tests {
             running_at_quit,
             "the command ended before quit's drain, so this run tested nothing"
         );
-        assert!(
-            shell_ended,
-            "quit's drain returned with the command's shell still running (marker touched: \
-             {finished})"
+        assert_eq!(
+            ended,
+            (true, true),
+            "(shell ended, worker ended) when quit's drain returned (marker touched: {finished})"
         );
         assert!(
             !finished,

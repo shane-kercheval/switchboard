@@ -13,14 +13,19 @@
 //! A command shell is a descendant of `agy` that leads its own session and has
 //! a terminal. That leaves out `agy --bg-updater`, the auto-updater, which
 //! leads a session with no terminal and is meant to outlive `agy`, and MCP
-//! servers, which run in `agy`'s own group. The walk does not enter a process
-//! being debugged: macOS reports a debugged process's debugger as its parent.
+//! servers, which run in `agy`'s own group.
+//!
+//! macOS lists a process being debugged under its debugger, so it may never
+//! have been under a command at all. Such a process is not recorded, the walk
+//! does not go below it, and it never makes its group a target; a recorded
+//! process seen being debugged is dropped from the record with every process
+//! under it.
 //!
 //! Processes are read from `/bin/ps`: calling libproc directly needs the
 //! `unsafe` the workspace forbids, and the `libproc` crate needs libclang to
-//! build. A listing that fails or does not parse is skipped, so nothing is
-//! signalled, and the kill is the group kill alone, when no listing before
-//! `agy` exits records a shell or when the listing after it exits fails.
+//! build. A listing that fails or does not parse is skipped. No command is
+//! signalled when no listing works while `agy` runs or the one after it exits
+//! fails, and none is sent SIGKILL when the one after the SIGTERM fails.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::process::Stdio;
@@ -53,30 +58,88 @@ struct Process {
     started: String,
 }
 
-/// A process seen in one snapshot, to be found again in a later one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Recorded {
-    pid: u32,
-    started: String,
-    /// The group it was in when seen.
-    pgid: u32,
+/// Processes seen in earlier listings: each one's pid, with the start time it
+/// had then.
+type Seen = HashMap<u32, String>;
+
+/// Whether `process` is the one `seen` holds under its pid.
+fn was_seen(seen: &Seen, process: &Process) -> bool {
+    seen.get(&process.pid)
+        .is_some_and(|started| *started == process.started)
 }
 
-impl Recorded {
-    /// Whether `process` is this process: the same pid with another start
-    /// time is another process.
-    fn is(&self, process: &Process) -> bool {
-        self.pid == process.pid && self.started == process.started
-    }
+/// One listing, with each process's children, built once per listing.
+struct Tree<'a> {
+    processes: &'a [Process],
+    children: HashMap<u32, Vec<&'a Process>>,
 }
 
-impl From<&Process> for Recorded {
-    fn from(process: &Process) -> Self {
-        Self {
-            pid: process.pid,
-            started: process.started.clone(),
-            pgid: process.pgid,
+impl<'a> Tree<'a> {
+    fn new(processes: &'a [Process]) -> Self {
+        let mut children: HashMap<u32, Vec<&'a Process>> = HashMap::new();
+        for process in processes {
+            if process.pid != process.ppid {
+                children.entry(process.ppid).or_default().push(process);
+            }
         }
+        Self {
+            processes,
+            children,
+        }
+    }
+
+    /// Every process under the pids in `roots`, not counting them, reached
+    /// through children `enter` accepts.
+    fn below(
+        &self,
+        roots: impl IntoIterator<Item = u32>,
+        enter: impl Fn(&Process) -> bool,
+    ) -> Vec<&'a Process> {
+        let mut stack: Vec<u32> = roots.into_iter().collect();
+        let mut visited: HashSet<u32> = stack.iter().copied().collect();
+        let mut found = Vec::new();
+        while let Some(parent) = stack.pop() {
+            for &child in self.children.get(&parent).into_iter().flatten() {
+                if enter(child) && visited.insert(child.pid) {
+                    found.push(child);
+                    stack.push(child.pid);
+                }
+            }
+        }
+        found
+    }
+
+    /// The command shells under `agy`: descendants, reached through processes
+    /// not being debugged, that lead their own session and have a terminal.
+    fn shells_under(&self, agy: u32) -> Vec<&'a Process> {
+        self.below([agy], |process| !process.traced)
+            .into_iter()
+            .filter(|process| {
+                process.session_leader && process.has_terminal && process.pgid == process.pid
+            })
+            .collect()
+    }
+
+    /// The processes in this listing that `known` accepts, split into those
+    /// to follow and those to drop: each one being debugged, and each one
+    /// under one of those.
+    fn split_known(
+        &self,
+        known: impl Fn(&Process) -> bool,
+    ) -> (Vec<&'a Process>, Vec<&'a Process>) {
+        let running: Vec<&'a Process> = self.processes.iter().filter(|p| known(p)).collect();
+        let debugged: Vec<u32> = running.iter().filter(|p| p.traced).map(|p| p.pid).collect();
+        let mut dropped: HashSet<u32> = debugged.iter().copied().collect();
+        dropped.extend(self.below(debugged, |_| true).iter().map(|p| p.pid));
+        running.into_iter().partition(|p| !dropped.contains(&p.pid))
+    }
+
+    /// `roots` and every process under them, reached through processes not
+    /// being debugged.
+    fn with_everything_under(&self, mut roots: Vec<&'a Process>) -> Vec<&'a Process> {
+        let under = self.below(roots.iter().map(|p| p.pid), |p| !p.traced);
+        roots.extend(under);
+        roots
     }
 }
 
@@ -85,7 +148,10 @@ impl From<&Process> for Recorded {
 #[derive(Debug)]
 pub(super) struct CommandShells {
     turn_id: TurnId,
-    recorded: Vec<Recorded>,
+    recorded: Seen,
+    /// Whether any listing has worked.
+    listed: bool,
+    /// Whether a failed listing has been logged.
     warned: bool,
 }
 
@@ -93,13 +159,13 @@ impl CommandShells {
     pub(super) fn new(turn_id: TurnId) -> Self {
         Self {
             turn_id,
-            recorded: Vec::new(),
+            recorded: Seen::new(),
+            listed: false,
             warned: false,
         }
     }
 
-    /// Add the command shells now under `agy` and every process now under a
-    /// recorded process.
+    /// Add the command shells now under `agy`, then [`Self::follow`].
     pub(super) async fn record(&mut self, agy: u32) {
         if let Some(processes) = self.snapshot().await {
             self.note(&processes, agy);
@@ -107,21 +173,28 @@ impl CommandShells {
     }
 
     fn note(&mut self, processes: &[Process], agy: u32) {
-        let shells = shells_under(processes, agy);
-        self.add(shells);
-        let under = still_under(processes, &self.recorded);
-        self.add(under);
+        let tree = Tree::new(processes);
+        let shells = tree.shells_under(agy);
+        self.add(&shells);
+        self.follow(&tree);
     }
 
-    fn add(&mut self, found: Vec<Recorded>) {
-        for found in found {
-            if !self
-                .recorded
-                .iter()
-                .any(|known| known.pid == found.pid && known.started == found.started)
-            {
-                self.recorded.push(found);
-            }
+    /// Drop the recorded processes `tree` shows being debugged, and those
+    /// under them, then record every process under the rest. Returns the
+    /// recorded processes running in `tree` and every process under them.
+    fn follow<'a>(&mut self, tree: &Tree<'a>) -> Vec<&'a Process> {
+        let (kept, dropped) = tree.split_known(|process| was_seen(&self.recorded, process));
+        for process in dropped {
+            self.recorded.remove(&process.pid);
+        }
+        let members = tree.with_everything_under(kept);
+        self.add(&members);
+        members
+    }
+
+    fn add(&mut self, processes: &[&Process]) {
+        for process in processes {
+            self.recorded.insert(process.pid, process.started.clone());
         }
     }
 
@@ -139,13 +212,26 @@ impl CommandShells {
     /// wait up to [`TERMINATE_GRACE`] for those groups to empty, then SIGKILL
     /// a group that a new listing shows still holds one of them.
     pub(super) async fn end(mut self, agy: u32) {
+        if !self.listed {
+            tracing::warn!(
+                turn_id = %self.turn_id,
+                "antigravity: no process listing worked while agy ran, so a command it ran \
+                 on a terminal of its own, if any, is left running"
+            );
+            return;
+        }
         if self.recorded.is_empty() {
             return;
         }
         let Some(now) = self.snapshot().await else {
+            tracing::warn!(
+                turn_id = %self.turn_id,
+                "antigravity: no process listing after agy exited, so the commands it ran on \
+                 terminals of their own are left running"
+            );
             return;
         };
-        let members = still_under(&now, &self.recorded);
+        let members = self.follow(&Tree::new(&now));
         let groups = groups_of(&members, agy, getpgrp().as_raw().cast_unsigned());
         if groups.is_empty() {
             return;
@@ -170,6 +256,11 @@ impl CommandShells {
             return;
         }
         let Some(later) = self.snapshot().await else {
+            tracing::warn!(
+                turn_id = %self.turn_id, groups = ?remaining,
+                "antigravity: no process listing after SIGTERM, so these command groups, \
+                 still running, are not sent SIGKILL"
+            );
             return;
         };
         for group in still_held(&later, &members, &remaining) {
@@ -178,17 +269,19 @@ impl CommandShells {
     }
 
     /// Every process now running, or `None` after logging why not; the
-    /// warning is logged once per stop.
+    /// reason is logged once per stop.
     async fn snapshot(&mut self) -> Option<Vec<Process>> {
         match read_processes().await {
-            Ok(processes) => Some(processes),
+            Ok(processes) => {
+                self.listed = true;
+                Some(processes)
+            }
             Err(reason) => {
                 if !self.warned {
                     self.warned = true;
                     tracing::warn!(
                         turn_id = %self.turn_id, %reason,
-                        "antigravity: could not list processes, so commands agy runs on \
-                         terminals of their own are left running"
+                        "antigravity: could not list processes"
                     );
                 }
                 None
@@ -276,67 +369,12 @@ fn next_field(text: &str) -> Option<(&str, &str)> {
     Some((&text[..end], &text[end..]))
 }
 
-/// Every process under `root`, not counting `root`. The walk does not enter a
-/// process being debugged: macOS reports its debugger as its parent, so it
-/// may have been started anywhere.
-fn descendants(processes: &[Process], root: u32) -> Vec<&Process> {
-    let mut children: HashMap<u32, Vec<&Process>> = HashMap::new();
-    for process in processes {
-        if process.pid != process.ppid && !process.traced {
-            children.entry(process.ppid).or_default().push(process);
-        }
-    }
-    let mut found = Vec::new();
-    let mut seen = HashSet::from([root]);
-    let mut stack = vec![root];
-    while let Some(parent) = stack.pop() {
-        for &child in children.get(&parent).into_iter().flatten() {
-            if seen.insert(child.pid) {
-                found.push(child);
-                stack.push(child.pid);
-            }
-        }
-    }
-    found
-}
-
-/// The command shells under `agy`: descendants that lead their own session
-/// and have a terminal.
-fn shells_under(processes: &[Process], agy: u32) -> Vec<Recorded> {
-    descendants(processes, agy)
-        .into_iter()
-        .filter(|process| {
-            process.session_leader && process.has_terminal && process.pgid == process.pid
-        })
-        .map(Recorded::from)
-        .collect()
-}
-
-/// The recorded processes still running in `processes`, each found by its
-/// pid and start time, and every process under them, with the groups they
-/// are in now.
-fn still_under(processes: &[Process], recorded: &[Recorded]) -> Vec<Recorded> {
-    let mut members = Vec::new();
-    for known in recorded {
-        let Some(running) = processes.iter().find(|process| known.is(process)) else {
-            continue;
-        };
-        for process in std::iter::once(running).chain(descendants(processes, running.pid)) {
-            let member = Recorded::from(process);
-            if !members.contains(&member) {
-                members.push(member);
-            }
-        }
-    }
-    members
-}
-
 /// The process groups `members` are in. Each member was found under a shell
 /// through parents not being debugged, and a shell leads its own session, in
 /// which every process was forked from one already in it, so each of these
 /// groups holds only processes started under a shell. Groups 0 and 1, `agy`'s
 /// group and Switchboard's own group (`own`) are left out all the same.
-fn groups_of(members: &[Recorded], agy: u32, own: u32) -> BTreeSet<u32> {
+fn groups_of(members: &[&Process], agy: u32, own: u32) -> BTreeSet<u32> {
     members
         .iter()
         .map(|member| member.pgid)
@@ -345,17 +383,28 @@ fn groups_of(members: &[Recorded], agy: u32, own: u32) -> BTreeSet<u32> {
 }
 
 /// The groups in `groups` that still hold one of `members`: a process in
-/// `processes` with a member's pid, start time and group. A group holding one
-/// is still the group recorded, whatever else has joined it.
+/// `processes` with a member's pid, start time and group, not being debugged
+/// and not under a member that is. A group holding one is still the group
+/// recorded, whatever else has joined it.
 fn still_held(
     processes: &[Process],
-    members: &[Recorded],
+    members: &[&Process],
     groups: &BTreeSet<u32>,
 ) -> BTreeSet<u32> {
-    processes
-        .iter()
-        .filter(|process| groups.contains(&process.pgid))
-        .filter(|process| members.contains(&Recorded::from(*process)))
+    let by_pid: HashMap<u32, &Process> =
+        members.iter().map(|member| (member.pid, *member)).collect();
+    let (kept, _) = Tree::new(processes).split_known(|process| {
+        by_pid
+            .get(&process.pid)
+            .is_some_and(|member| member.started == process.started)
+    });
+    kept.into_iter()
+        .filter(|process| {
+            groups.contains(&process.pgid)
+                && by_pid
+                    .get(&process.pid)
+                    .is_some_and(|member| member.pgid == process.pgid)
+        })
         .map(|process| process.pgid)
         .collect()
 }
@@ -389,8 +438,17 @@ mod tests {
         parse_processes(PROBE).unwrap()
     }
 
-    fn pids(recorded: &[Recorded]) -> Vec<u32> {
-        recorded.iter().map(|r| r.pid).collect()
+    fn pids(processes: &[&Process]) -> Vec<u32> {
+        processes.iter().map(|p| p.pid).collect()
+    }
+
+    /// A [`CommandShells`] that has noted each of `listings` in turn.
+    fn noted(listings: &[&[Process]]) -> CommandShells {
+        let mut shells = CommandShells::new(uuid::Uuid::nil());
+        for listing in listings {
+            shells.note(listing, AGY);
+        }
+        shells
     }
 
     #[test]
@@ -443,7 +501,8 @@ mod tests {
         // Not the updater (no terminal), the MCP server or `agy` (its group),
         // the shell's `sleep` (no session of its own), or a terminal shell
         // outside `agy`'s tree.
-        assert_eq!(pids(&shells_under(&probe(), AGY)), vec![9022]);
+        let processes = probe();
+        assert_eq!(pids(&Tree::new(&processes).shells_under(AGY)), vec![9022]);
     }
 
     #[test]
@@ -455,12 +514,12 @@ mod tests {
 ",
         )
         .unwrap();
-        assert_eq!(pids(&shells_under(&processes, AGY)), vec![9022]);
+        assert_eq!(pids(&Tree::new(&processes).shells_under(AGY)), vec![9022]);
     }
 
     #[test]
     fn once_agy_is_gone_the_shell_and_what_runs_under_it_are_found_by_start_time() {
-        let recorded = shells_under(&probe(), AGY);
+        let mut shells = noted(&[&probe()]);
         let reparented = parse_processes(
             " 9022     1  9022 Ss+  s001  Thu Nov 19 23:29:21 2026
  9024  9022  9022 S+   s001  Thu Nov 19 23:29:21 2026
@@ -468,7 +527,7 @@ mod tests {
 ",
         )
         .unwrap();
-        let members = still_under(&reparented, &recorded);
+        let members = shells.follow(&Tree::new(&reparented));
         assert_eq!(pids(&members), vec![9022, 9024, 9030]);
         assert_eq!(
             groups_of(&members, AGY, OWN),
@@ -482,30 +541,64 @@ mod tests {
         // The command runs `lldb` (9030), whose `debugserver` (9031) has
         // attached to a terminal shell outside `agy`'s tree (700, running
         // 701), so `ps` lists that shell as the debugger's child.
-        let processes = parse_processes(concat!(
-            " 8970  8966  8970 S      ??  Thu Nov 19 23:29:12 2026\n",
-            " 9022  8970  9022 Ss+  s001  Thu Nov 19 23:29:21 2026\n",
-            " 9030  9022  9022 S+   s001  Thu Nov 19 23:29:22 2026\n",
-            " 9031  9030  9022 S+   s001  Thu Nov 19 23:29:22 2026\n",
-            "  700  9031   700 SXs+ s002  Thu Nov 19 08:00:01 2026\n",
-            "  701   700   701 S+   s002  Thu Nov 19 08:00:05 2026\n",
-        ))
-        .unwrap();
-        let shells = shells_under(&processes, AGY);
+        let processes = debugger_rows(Some(("SXs+", 9031)));
         assert_eq!(
-            pids(&shells),
+            pids(&Tree::new(&processes).shells_under(AGY)),
             vec![9022],
             "a debugged shell is no command shell"
         );
-        let members = still_under(&processes, &shells);
+        let members = noted(&[]).follow_shells(&processes);
         assert_eq!(pids(&members), vec![9022, 9030, 9031]);
         assert_eq!(groups_of(&members, AGY, OWN), BTreeSet::from([9022]));
     }
 
+    /// The command runs `lldb` (9030), whose `debugserver` (9031) attaches to
+    /// a terminal shell outside `agy`'s tree (700, running 701). `X` marks 700
+    /// as debugged and 650 is its parent; `None` lists it as the debugger's
+    /// undebugged child, as a listing does when the attach lands between the
+    /// kernel's reads of its traced flag and its parent.
+    fn debugger_rows(outside: Option<(&str, u32)>) -> Vec<Process> {
+        let (stat, parent) = outside.unwrap_or(("Ss+", 9031));
+        parse_processes(&format!(
+            " 8970  8966  8970 S      ??  Thu Nov 19 23:29:12 2026
+ 9022  8970  9022 Ss+  s001  Thu Nov 19 23:29:21 2026
+ 9030  9022  9022 S+   s001  Thu Nov 19 23:29:22 2026
+ 9031  9030  9022 S+   s001  Thu Nov 19 23:29:22 2026
+  700 {parent:>5}   700 {stat:<4} s002  Thu Nov 19 08:00:01 2026
+  701   700   701 S+   s002  Thu Nov 19 08:00:05 2026
+"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_process_listed_mid_attach_is_dropped_once_seen_being_debugged() {
+        let racy = debugger_rows(None);
+        let attached = debugger_rows(Some(("SXs+", 9031)));
+        let detached = debugger_rows(Some(("Ss+", 650)));
+        let mut shells = noted(&[&racy, &attached]);
+        assert_eq!(
+            pids(&shells.follow(&Tree::new(&detached))),
+            vec![9022, 9030, 9031],
+            "700 and 701 stay dropped after the debugger detaches"
+        );
+    }
+
+    #[test]
+    fn a_debugged_member_is_no_reason_for_sigkill() {
+        let racy = debugger_rows(None);
+        let attached = debugger_rows(Some(("SXs+", 9031)));
+        let members = noted(&[]).follow_shells(&racy);
+        assert_eq!(
+            still_held(&attached, &members, &BTreeSet::from([9022, 700, 701])),
+            BTreeSet::from([9022]),
+            "a debugged member, and a member under it, are no reason for SIGKILL"
+        );
+    }
+
     #[test]
     fn a_process_seen_under_a_shell_is_ended_after_the_shell_exits() {
-        let mut shells = CommandShells::new(uuid::Uuid::nil());
-        shells.note(&probe(), AGY);
+        let mut shells = noted(&[&probe()]);
         // The shell's command finished while `agy` exited, leaving its
         // `sleep` to launchd in the shell's group, with a child of its own.
         let later = parse_processes(concat!(
@@ -513,33 +606,38 @@ mod tests {
             " 9040  9024  9022 S      ??  Thu Nov 19 23:29:40 2026\n",
         ))
         .unwrap();
-        shells.note(&later, AGY);
-        let members = still_under(&later, &shells.recorded);
+        let members = shells.follow_shells(&later);
         assert_eq!(pids(&members), vec![9024, 9040]);
         assert_eq!(groups_of(&members, AGY, OWN), BTreeSet::from([9022]));
     }
 
     #[test]
     fn a_pid_with_another_start_time_is_another_process() {
-        let recorded = shells_under(&probe(), AGY);
+        let mut shells = noted(&[&probe()]);
         let reused =
             parse_processes(" 9022     1  9022 Ss+  s003  Thu Nov 19 23:40:00 2026\n").unwrap();
-        assert!(still_under(&reused, &recorded).is_empty());
+        assert!(shells.follow(&Tree::new(&reused)).is_empty());
     }
 
     #[test]
     fn groups_0_1_agys_and_switchboards_are_never_targets() {
-        let members = [AGY, OWN, 0, 1, 9022].map(|pgid| Recorded {
+        let members = [AGY, OWN, 0, 1, 9022].map(|pgid| Process {
             pid: 9100 + pgid,
-            started: "Thu Nov 19 23:29:21 2026".to_owned(),
+            ppid: 1,
             pgid,
+            session_leader: false,
+            has_terminal: false,
+            traced: false,
+            started: "Thu Nov 19 23:29:21 2026".to_owned(),
         });
+        let members: Vec<&Process> = members.iter().collect();
         assert_eq!(groups_of(&members, AGY, OWN), BTreeSet::from([9022]));
     }
 
     #[test]
     fn a_group_is_killed_only_while_it_holds_a_recorded_process() {
-        let members = still_under(&probe(), &shells_under(&probe(), AGY));
+        let processes = probe();
+        let members = noted(&[]).follow_shells(&processes);
         let groups = BTreeSet::from([9022]);
         // The shell ignored SIGTERM and lives on: still the group recorded.
         let shell_left =
@@ -553,5 +651,14 @@ mod tests {
         let moved =
             parse_processes(" 9024     1  9024 S    s001 Thu Nov 19 23:29:21 2026\n").unwrap();
         assert!(still_held(&moved, &members, &groups).is_empty());
+    }
+
+    impl CommandShells {
+        /// Note `processes`, then follow it: the members `end` would act on
+        /// were this the listing after `agy` exits.
+        fn follow_shells<'a>(&mut self, processes: &'a [Process]) -> Vec<&'a Process> {
+            self.note(processes, AGY);
+            self.follow(&Tree::new(processes))
+        }
     }
 }

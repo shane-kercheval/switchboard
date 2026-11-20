@@ -158,16 +158,18 @@ Since Claude Code 2.1.277, the cost and token totals on a resumed turn's `result
 
 **What we know.**
 
-- Removing an agent (`remove_agent_impl`), deleting a project (`delete_project_impl`) and changing a project's folder (`set_project_directory_impl`), all in `desktop/src-tauri/src/commands.rs`, stop the agent's actor through the dispatcher and mark its slot `Closing` while they wait. Read from source on 2026-11-20.
-- Quit (`finish_orderly_quit` in `desktop/src-tauri/src/lib.rs`) runs `drain_agents_then_release_locks`, which calls `Dispatcher::shutdown_agent` for each agent. `shutdown_agent` returns at once when the slot is already `Closing` (`begin_close` returns `None`), by design: the other caller owns the drain.
-- So a quit that starts while one of those actions is still stopping an agent does not wait for that agent. It can release the project's lock and exit while the agent's turn is still being cancelled, and exiting ends the other action's wait too. What that leaves running is not checked; the expectation is that `agy`, and the commands G52's cleanup would have ended, can keep running.
+- Quit (`finish_orderly_quit` in `desktop/src-tauri/src/lib.rs`) builds its lists of agents and projects from `agents_by_id` and `projects`, then runs `drain_agents_then_release_locks`, which calls `Dispatcher::shutdown_agent` for each listed agent. Read from source on 2026-11-20.
+- Removing an agent (`remove_agent_impl` in `desktop/src-tauri/src/commands.rs`) stops its actor through `Dispatcher::remove_agent`, which marks the slot `Closing` while it waits, and removes the agent from `agents_by_id` only once the actor has stopped. So quit lists the agent, but its `shutdown_agent` returns at once because the slot is already `Closing` (`begin_close` returns `None`), by design: the other caller owns the drain.
+- Deleting a project (`delete_project_impl`) and changing a project's folder (`set_project_directory_impl`) start with `begin_maintenance`, which removes the project from `projects` and its agents from `agents_by_id` before stopping them. So quit does not list those agents at all.
+- Either way, a quit that starts while one of those actions is still stopping an agent does not wait for that agent. It can release the project's lock and exit while the agent's turn is still being cancelled, and exiting ends the other action's wait too. What that leaves running is not checked; the expectation is that `agy`, and the commands G52's cleanup would have ended, can keep running.
 - The trigger is narrow: an agent with a running turn is removed, or its project deleted or moved, and the user quits within the seconds stopping it takes. Found in review of the G52 fix on 2026-11-20; it predates that change.
 
 **Why it waits.** The fix changes how the dispatcher stops agents for every harness and for each path above, which is outside the change that found it.
 
-**A candidate approach.** This is recorded, not decided. One option is a completion signal shared by every caller: a caller that finds the slot already `Closing` waits for the signal the first caller fires once the actor has stopped, instead of returning at once. A test would overlap a removal with a quit while the adapter is paused in its kill path, and assert that the quit's drain returns only after the actor has stopped.
+**A candidate approach.** This is recorded, not decided. The fix has two parts. First, quit finds every agent the dispatcher is still running or stopping, from the dispatcher's own slots, rather than from `agents_by_id`; alternatively it waits for any project change in progress to finish. Second, a caller that finds a slot already `Closing` waits for a completion signal the first caller fires once the actor has stopped, instead of returning at once. A shared completion signal alone fixes only the removal case. A test would overlap each of the three actions with a quit while the adapter is paused in its kill path, and assert that the quit's drain returns only after the actor has stopped.
 
 **Where the detail is.**
 
-- `Dispatcher::shutdown_agent` and `begin_close` in `crates/dispatcher/src/lib.rs`.
+- `Dispatcher::shutdown_agent`, `Dispatcher::remove_agent` and `begin_close` in `crates/dispatcher/src/lib.rs`.
+- `begin_maintenance` in `desktop/src-tauri/src/commands.rs`, and `finish_orderly_quit` in `desktop/src-tauri/src/lib.rs`.
 - G52 in `docs/harness-behavior.md`, whose quit claim names this exception.

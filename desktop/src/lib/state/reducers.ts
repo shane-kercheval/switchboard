@@ -745,8 +745,9 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // still land on `processing` rather than silently dropping the
       // event. `pending_message_id` is cleared so a new dispatch doesn't
       // surface stale state. `last_error` ("Last turn failed") is cleared here
-      // and nowhere else, except by a context report: a report is a diagnostic
-      // the user opens to investigate a failure, so it never touches it.
+      // and nowhere else, except when the turn is a context report: a report is
+      // a diagnostic the user opens to investigate a failure, so it never
+      // touches it.
       return {
         ...runtime,
         run_status: "processing",
@@ -783,13 +784,17 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       );
       if (idx < 0) {
         // A workflow send has no pending entry here (the backend does not
-        // announce it), so its failure arrives unmatched, with the agent idle.
-        // Only a failure naming its send counts: a shutdown's abandoned items
-        // carry no send id. One arriving while a send is pending or a turn runs
-        // is stale.
+        // announce it), so its failure arrives unmatched. It can arrive while
+        // the window still shows `processing`: the dispatcher sends no
+        // `agent_idle` between queued turns. It always arrives after the
+        // previous turn's `turn_end`, though, since the dispatcher runs one item
+        // at a time, so no turn is running. Only a failure naming its send
+        // counts: a shutdown's abandoned items carry no send id. One arriving
+        // while a turn runs is stale. One arriving while a send is pending is
+        // dropped: that send's turn will replace it.
         const isWorkflowFailure =
           input.send_id !== null &&
-          runtime.run_status === "idle" &&
+          runtime.turn_started_at === undefined &&
           (runtime.pending_sends === undefined || runtime.pending_sends.length === 0);
         return isWorkflowFailure ? { ...runtime, last_error: failure } : runtime;
       }

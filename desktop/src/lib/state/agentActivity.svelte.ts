@@ -59,12 +59,15 @@ export function deriveAgentActivity(input: ActivityInputs): AgentActivity {
   return { kind: "idle" };
 }
 
-/// The sources a held forward to this agent still waits on. A source is
-/// waited on while its `run_status` is not idle, the backend's own test (a send
-/// queued behind a finished turn is not held for). A source whose runtime this
-/// window doesn't hold, in an unopened project, is kept: it may be the one. If
-/// none is left while the forward is still held, all are named rather than
-/// none, so the card doesn't read idle just before the forward dispatches.
+/// The sources a held forward to this agent is likely still waiting on, an
+/// estimate: the backend waits on the turn each source was running when the
+/// forward began, which the window doesn't record. A source counts while its
+/// `run_status` is not idle (a send queued behind a finished turn is not held
+/// for), so one that finished and started another turn is still named. A
+/// source whose runtime this window doesn't hold, in an unopened project, is
+/// kept, though it may already be idle. If none is left while the forward is
+/// still held, all are named, idle ones included, so the card doesn't read
+/// idle just before the forward dispatches.
 function heldForwardTargets(input: ActivityInputs): WaitTarget[] {
   return input.heldForwards
     .filter((forward) => forward.recipients.includes(input.agent.id))

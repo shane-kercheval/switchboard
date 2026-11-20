@@ -278,6 +278,8 @@ describe("an agent card's status", () => {
     });
     await tick();
     expect(card(DOCS)).toHaveAttribute("data-activity", "working");
+    // A report has no transcript row; its time comes from the turn's start.
+    expect(within(card(DOCS)).getByTestId("agent-status-elapsed")).toBeInTheDocument();
     fireTo(`agent:${DOCS.id}`, {
       type: "turn_end",
       turn_id: "turn-r",

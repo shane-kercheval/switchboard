@@ -2000,6 +2000,12 @@ describe("context breakdown requests", () => {
   it("records an IPC rejection on the request and renders no failed row", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
+    const before = state.runtimes[AGENT_A];
+    if (before === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_A] = {
+      ...before,
+      last_error: { message: "the turn the user is investigating", kind: "harness_error" },
+    };
     invokeMock.mockRejectedValue(new Error("alice has no conversation to analyze yet"));
 
     await state.dispatchContextReport(AGENT_A, SEND, PENDING, QUEUED_AT);
@@ -2008,6 +2014,8 @@ describe("context breakdown requests", () => {
       phase: "failed",
       error: "alice has no conversation to analyze yet",
     });
+    // The report's error stays on its record; the card keeps the earlier failure.
+    expect(state.runtimes[AGENT_A]?.last_error?.message).toBe("the turn the user is investigating");
     expect(state.transcripts[AGENT_A]).toEqual([]);
     expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
     expect(state.runtimes[AGENT_A]?.run_status).toBe("idle");

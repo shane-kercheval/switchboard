@@ -1758,7 +1758,7 @@ describe("runtimeReducer", () => {
       at: "2026-05-16T00:00:00Z",
     });
 
-    it("records a workflow send's failure: it names its send and the agent is idle", () => {
+    it("records a workflow send's failure: it names its send and no turn is running", () => {
       const r = runtimeReducer(fresh(), unmatched("send-w"));
       expect(r.last_error).toEqual({
         message: "claude: command not found",
@@ -1768,6 +1768,23 @@ describe("runtimeReducer", () => {
 
     it("ignores a shutdown's abandoned item, which names no send", () => {
       const r = runtimeReducer(fresh(), unmatched(null));
+      expect(r.last_error).toBeUndefined();
+    });
+
+    it("records a queued workflow send's failure that arrives before agent_idle", () => {
+      // The dispatcher sends no agent_idle between queued turns, so the next
+      // send's launch failure lands while the window still shows processing.
+      let r = runtimeReducer(fresh(), turnStart(TURN_1));
+      r = runtimeReducer(r, turnEndCompleted(TURN_1));
+      expect(r.run_status).toBe("processing");
+      r = runtimeReducer(r, unmatched("send-w"));
+      expect(r.last_error?.message).toBe("claude: command not found");
+      r = runtimeReducer(r, { type: "agent_idle", agent_id: AGENT_A });
+      expect(r.last_error?.message).toBe("claude: command not found");
+    });
+
+    it("ignores one that arrives while a turn is running", () => {
+      const r = runtimeReducer(runtimeReducer(fresh(), turnStart(TURN_1)), unmatched("send-w"));
       expect(r.last_error).toBeUndefined();
     });
   });

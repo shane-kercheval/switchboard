@@ -1803,9 +1803,15 @@ async fn live_claude_fork_inherits_context_on_the_caller_assigned_session() {
 /// bounded observation at one CLI version, not a guarantee; see
 /// harness-behavior.md §3.5. The recovery invariant asserted here is
 /// state-independent, and the deterministic per-state arg coverage lives in
-/// the `build_args` unit tests. Which state a given run exercises depends on
-/// timing; with a tiny parent it cannot be the size-sensitive copy window the
-/// probe explored at 160 KB.)
+/// the `build_args` unit tests.)
+///
+/// The cancel lands at the turn's first content, so this test exercises the
+/// *present* state: Claude writes the child file, holding the parent's copy and
+/// the fork's own prompt, before the model's first output (probed @ 2.1.329:
+/// file at ~1.4 s, first content at ~1.9 s, turn end at ~2.6 s). The *absent*
+/// state needs a cancel before the copy, and only the unit tests cover it.
+/// Cancelling on an event rather than after a fixed delay keeps a fast model
+/// from finishing the turn before the cancel lands.
 ///
 /// The cancelled turn's prompt is deliberately long-running — an exception to
 /// AGENTS.md's tiny-response cost discipline, because the test needs a window
@@ -1843,7 +1849,7 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
     // Cancel the fork's first dispatch mid-flight, exactly as the dispatcher's
     // cancel path does (the token kills the subprocess group).
     let token = tokio_util::sync::CancellationToken::new();
-    let stream = adapter
+    let mut stream = adapter
         .dispatch(
             &fork,
             &cwd,
@@ -1856,19 +1862,27 @@ async fn live_claude_fork_recovers_from_a_cancelled_first_dispatch() {
         )
         .await
         .expect("the fork's first dispatch should spawn");
-    let canceller = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        token.cancel();
-    });
-    let cancelled_events: Vec<AdapterEvent> = stream.collect().await;
-    canceller.await.expect("canceller task");
+    let mut cancelled_events: Vec<AdapterEvent> = Vec::new();
+    while let Some(event) = stream.next().await {
+        if matches!(event, AdapterEvent::ContentChunk { .. }) {
+            token.cancel();
+        }
+        cancelled_events.push(event);
+    }
 
     // The cancel must have genuinely interrupted the turn. The adapter's
     // cancel contract is to end the stream WITHOUT a terminal event (the
     // dispatcher synthesizes the Cancelled terminal) — so any `TurnEnd` here
-    // means claude finished inside the sleep and this run proved nothing the
-    // happy-path test doesn't. Fail loudly rather than pass vacuously; if
-    // models get fast enough to finish 50 lines in 3 s, widen the prompt.
+    // means claude finished before the cancel landed and this run proved
+    // nothing the happy-path test doesn't. Fail loudly rather than pass
+    // vacuously.
+    assert!(
+        cancelled_events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::ContentChunk { .. })),
+        "the first dispatch produced no content, so the cancel never fired. \
+         Events: {cancelled_events:?}"
+    );
     assert!(
         !cancelled_events
             .iter()

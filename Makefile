@@ -225,8 +225,11 @@ check-ios:
 	ios/scripts/check-info-plist.sh $(IOS_DERIVED_DATA)/Build/Products/Debug-iphonesimulator/SwitchboardMobile.app/Info.plist Debug
 	ios/scripts/check-info-plist.sh $(IOS_DERIVED_DATA)/Build/Products/Release-iphonesimulator/SwitchboardMobile.app/Info.plist Release
 
+# `--no-fail-fast` runs every test binary even after one fails, so a single
+# failure cannot hide the results of the binaries after it; cargo still exits
+# non-zero when any test fails.
 test-live:
-	cargo test --locked $(LIVE_PKGS) -- --ignored
+	cargo test --locked --no-fail-fast $(LIVE_PKGS) -- --ignored
 
 # Per-harness live tests, to spend subscription quota on only the harness you
 # care about (e.g. after a CLI version bump). Each filters by the harness name,
@@ -234,13 +237,13 @@ test-live:
 # AGENTS.md). Preview without spending quota by appending `--list` to the
 # underlying cargo command.
 test-live-claude:
-	cargo test --locked $(LIVE_PKGS) claude -- --ignored
+	cargo test --locked --no-fail-fast $(LIVE_PKGS) claude -- --ignored
 
 test-live-codex:
-	cargo test --locked $(LIVE_PKGS) codex -- --ignored
+	cargo test --locked --no-fail-fast $(LIVE_PKGS) codex -- --ignored
 
 test-live-antigravity:
-	cargo test --locked $(LIVE_PKGS) antigravity -- --ignored
+	cargo test --locked --no-fail-fast $(LIVE_PKGS) antigravity -- --ignored
 
 # Snapshot a harness CLI's command surface (every command and subcommand's
 # help, plus its slash commands or app-server methods) for a harness update
